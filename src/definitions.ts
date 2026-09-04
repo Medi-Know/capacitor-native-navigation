@@ -120,6 +120,12 @@ export interface NativeNavigationIcon {
   svg?: string;
 
   /**
+   * Masks the rendered image into a circle. Only meaningful for rasters
+   * passed through `src` as a data: URI — an avatar, typically.
+   */
+  circular?: boolean;
+
+  /**
    * Preferred rendered icon width in native points/dp. Defaults to `24`.
    */
   width?: number;
@@ -284,9 +290,50 @@ export interface NativeNavigationBarButton {
   icon?: NativeNavigationIcon;
 
   /**
+   * Colour for this item alone, as `#RRGGBB` or `#RRGGBBAA`. Omitted, the
+   * item inherits the bar's tint. Only affects template images (SF Symbols
+   * and SVG icons), not rasters passed with `template: false`.
+   */
+  tintColor?: string;
+
+  /**
+   * Draws a filled dot of this colour in the icon's top-right corner, for
+   * "something is waiting here". Requires an icon; bakes `tintColor` into the
+   * image, since a two-coloured icon cannot stay a template.
+   */
+  badgeColor?: string;
+
+  /**
    * Whether the action is enabled. Defaults to `true`.
    */
   enabled?: boolean;
+
+  /**
+   * Turns the button into an anchored menu (iOS `UIMenu`) instead of a plain
+   * tap. Each entry reports through `navbarItemTap` with its own id.
+   */
+  menu?: NativeNavigationMenuEntry[];
+}
+
+/**
+ * One entry of a bar button's menu.
+ */
+export interface NativeNavigationMenuEntry {
+  id: string;
+  title: string;
+  icon?: NativeNavigationIcon;
+  destructive?: boolean;
+  /** Greyed out and untappable. Defaults to `true`. */
+  enabled?: boolean;
+  /** Keeps the menu open after the tap (iOS 16+), for steppers. */
+  keepsMenuOpen?: boolean;
+  /** Ticked (iOS `UIMenuElement.State.on`), for the option in force. */
+  checked?: boolean;
+  /**
+   * Makes the entry a submenu of these entries. A submenu reports no tap
+   * of its own; its children report with their ids like any entry.
+   */
+  children?: NativeNavigationMenuEntry[];
 }
 
 /**
@@ -500,6 +547,13 @@ export interface NativeNavigationTabbarStyle {
  * Native tabbar state.
  */
 export interface NativeNavigationTabbarOptions {
+  /**
+   * Colour behind a tab's content, as `#RRGGBB`. Shown for the frame between
+   * tabs while the web view is re-hosted; defaults to the system background,
+   * which is white in light mode and flashes over any page that is not.
+   */
+  contentBackground?: string;
+
   /**
    * Hide the native tabbar.
    */
@@ -728,6 +782,13 @@ export interface NativeNavigationPlugin {
    * Capture the current WebView and prepare a native transition.
    */
   beginTransition(options?: NativeNavigationBeginTransitionOptions): Promise<NativeNavigationTransitionResult>;
+
+  /**
+   * Takes down the snapshot a tab switch left covering the web view. Call it
+   * once the new route has been drawn; a timeout uncovers it regardless, so a
+   * missed call costs the flicker, not a frozen screen.
+   */
+  finishTabTransition(): Promise<void>;
 
   /**
    * Animate from the captured WebView snapshot to the current live WebView.

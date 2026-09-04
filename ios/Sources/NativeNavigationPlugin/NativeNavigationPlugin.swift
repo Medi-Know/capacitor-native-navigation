@@ -4,6 +4,7 @@ import Foundation
 import Capacitor
 import ObjectiveC
 import UIKit
+import WebKit
 
 private struct NativeNavigationTransitionContext {
     let webView: UIView
@@ -33,6 +34,7 @@ public class NativeNavigationPlugin: CAPPlugin, CAPBridgedPlugin, UITabBarContro
         CAPPluginMethod(name: "setTabbar", returnType: CAPPluginReturnPromise),
         CAPPluginMethod(name: "beginTransition", returnType: CAPPluginReturnPromise),
         CAPPluginMethod(name: "finishTransition", returnType: CAPPluginReturnPromise),
+        CAPPluginMethod(name: "finishTabTransition", returnType: CAPPluginReturnPromise),
         CAPPluginMethod(name: "getPluginVersion", returnType: CAPPluginReturnPromise)
     ]
 
@@ -57,13 +59,40 @@ public class NativeNavigationPlugin: CAPPlugin, CAPBridgedPlugin, UITabBarContro
     private var navbarHeight: CGFloat = 44
     private var tabbarHeight: CGFloat = NativeNavigationTabbarStyleConfig().totalHeight
     private var navbarVisible = false
+
+    /// Whether the bar currently on screen is the hosted one (a real
+    /// `UINavigationController` bar) rather than capgo's overlay.
+    ///
+    /// It decides who reserves the strip under the notch. The hosted bar is
+    /// part of the web view's own safe area, so `env(safe-area-inset-top)`
+    /// already covers it and `currentInsets()` must report 0 — reporting the
+    /// height as well would reserve it twice.
+    private var navbarUsesHostedController = false
+    /// The last `setNavbar` that put a bar on a hosted controller, kept so a
+    /// tab switch can give the new tab the same bar before its view appears.
+    private var lastNavbarCall: CAPPluginCall?
+    private var lastNavbarLarge = false
     private var tabbarVisible = false
     private var contentInsetMode = "css"
     private var isEnabled = true
-    private var defaultTransitionDuration: TimeInterval = 0.35
+    private var defaultTransitionDuration: TimeInterval = 0.5
+    /// Whether a bar has been populated before, so the first one does not animate.
+    private var hasSetNavbarItems = false
+
+    /// Whether the tab bar has been shown before, for the same reason.
+    private var hasShownTabBar = false
     private var navbarItemPlacement: [String: String] = [:]
     private var navbarItemTitle: [String: String] = [:]
     private var tabIds: [String] = []
+
+    /// Ids behind the `UITab` objects currently assigned to the controller.
+    ///
+    /// Reassigning `tabs` tears the bar down and rebuilds it, which cancels
+    /// anything the system is in the middle of — including the search tab's
+    /// morph into a search field. The web layer re-pushes `setTabbar` right
+    /// after a tap (it navigates, then syncs the selection), so without this
+    /// the morph was destroyed a few milliseconds after it began.
+    private var appliedSystemTabIds: [String] = []
     private var tabTitles: [String] = []
     private var tabDisplayTitles: [String?] = []
     private var tabBaseImages: [UIImage?] = []
@@ -155,39 +184,186 @@ public class NativeNavigationPlugin: CAPPlugin, CAPBridgedPlugin, UITabBarContro
             self.navbarHeight = large ? 96 : 44
 
             guard !hidden else {
+                self.lastNavbarCall = nil
                 self.navContainer?.isHidden = true
+                self.hideHostedNavigationBar(animated: animated)
+                self.navbarUsesHostedController = false
                 self.updateInsetsAndNotify()
                 call.resolve(self.insetsResult())
                 return
             }
 
+            // Preferred path: write onto the navigation item of the controller
+            // that actually displays the web view, inside its own
+            // UINavigationController. UIKit draws glass, shadow and the scroll
+            // edge effect only for a bar it manages above a scroll view it
+            // knows about — capgo's overlay bar is a *sibling* of the web view,
+            // so UIKit sees no relationship between the two and none of it
+            // applies. Same reason the search tab's morph only ever worked
+            // once its bar was left in place.
+            if let content = self.hostedContentController(),
+               let navigation = content.navigationController {
+                self.lastNavbarCall = call
+                self.lastNavbarLarge = large
+                self.applyNavbarContents(to: content.navigationItem, options: call, large: large)
+                if #available(iOS 11.0, *) {
+                    navigation.navigationBar.prefersLargeTitles = large
+                }
+                navigation.setNavigationBarHidden(false, animated: animated)
+                self.navContainer?.isHidden = true
+                self.navbarUsesHostedController = true
+                self.updateInsetsAndNotify()
+                call.resolve(self.insetsResult())
+                return
+            }
+
+            // Fallback for pre-iOS-26 shells and for the moment before the tab
+            // controller exists: capgo's own overlay bar.
             let navBar = self.ensureNavBar()
-            let navItem = UINavigationItem(title: call.getString("title") ?? "")
-            navItem.prompt = call.getString("subtitle")
+            let navItem = UINavigationItem(title: "")
+            self.applyNavbarContents(to: navItem, options: call, large: large)
             if #available(iOS 11.0, *) {
                 navBar.prefersLargeTitles = large
-                navItem.largeTitleDisplayMode = large ? .always : .never
             }
-
-            self.navbarItemPlacement.removeAll()
-            self.navbarItemTitle.removeAll()
-
-            if let backButton = call.getObject("backButton"), backButton["visible"] as? Bool == true {
-                let title = backButton["title"] as? String
-                let item = UIBarButtonItem(title: title ?? "Back", style: .plain, target: self, action: #selector(self.handleNavbarBack))
-                self.configureGlassBarButtonItem(item, id: "back")
-                navItem.leftBarButtonItem = item
-            } else {
-                navItem.leftBarButtonItems = self.makeBarButtonItems(call.getArray("leftItems") as? [[String: Any]] ?? [], placement: "left")
-            }
-
-            navItem.rightBarButtonItems = self.makeBarButtonItems(call.getArray("rightItems") as? [[String: Any]] ?? [], placement: "right")
             navBar.setItems([navItem], animated: animated)
             self.applyNavBarAppearance(navBar: navBar, options: call)
             self.navContainer?.isHidden = false
+            self.navbarUsesHostedController = false
             self.layoutChrome()
             self.updateInsetsAndNotify()
             call.resolve(self.insetsResult())
+        }
+    }
+
+    /// Gives the tab being switched to the bar the current tab shows, before
+    /// its view appears.
+    ///
+    /// Every tab has a navigation controller of its own, made with the bar
+    /// hidden, and the web app pushes the bar for the new route only after
+    /// NavigationEnd. Until then the web view's safe area would be a bar
+    /// shorter than a moment ago: the page lost its top padding and got it
+    /// back a frame later. Re-applying the last bar keeps the safe area — and
+    /// the picture — identical across the switch; the web app's push then
+    /// updates the same bar in place.
+    ///
+    /// Not for the search tab: its bar surfaces the search field and is
+    /// handled on its own (see hideHostedNavigationBar).
+    private func carryHostedNavbar(to content: NativeNavigationTabContentController) {
+        guard navbarVisible,
+              navbarUsesHostedController,
+              let call = lastNavbarCall,
+              let navigation = content.navigationController,
+              content.navigationItem.searchController == nil else {
+            return
+        }
+
+        applyNavbarContents(to: content.navigationItem, options: call, large: lastNavbarLarge)
+        navigation.navigationBar.prefersLargeTitles = lastNavbarLarge
+        navigation.setNavigationBarHidden(false, animated: false)
+    }
+
+    /// Takes the hosted bar off screen again.
+    ///
+    /// The search tab is the exception: its bar is what surfaces
+    /// `navigationItem.searchController`, so hiding it takes the search field
+    /// down with it — the same mistake that once cost the tab bar's morph.
+    /// There the contents are cleared and the bar stays.
+    ///
+    /// - Parameter animated: Whether to animate the bar out.
+    private func hideHostedNavigationBar(animated: Bool) {
+        guard let content = hostedContentController(),
+              let navigation = content.navigationController else {
+            return
+        }
+
+        guard content.navigationItem.searchController == nil else {
+            content.navigationItem.title = nil
+            content.navigationItem.leftBarButtonItems = nil
+            content.navigationItem.rightBarButtonItems = nil
+            return
+        }
+
+        navigation.setNavigationBarHidden(true, animated: animated)
+    }
+
+    /// Fills a navigation item from a `setNavbar` call.
+    ///
+    /// Shared by both paths so the hosted bar and the overlay fallback show the
+    /// same thing. Every field is assigned unconditionally: the hosted item is
+    /// reused across calls, so anything left unset has to be cleared rather
+    /// than inherited from the previous page.
+    ///
+    /// - Parameters:
+    ///   - navItem: The item to fill.
+    ///   - call: The originating plugin call.
+    ///   - large: Whether the caller asked for a large title.
+    private func applyNavbarContents(to navItem: UINavigationItem, options call: CAPPluginCall, large: Bool) {
+        navItem.title = call.getString("title") ?? ""
+
+        // `prompt` renders a small line ABOVE the title — not a subtitle.
+        // iOS 26 added a real one that sits below it. Reached by selector
+        // so this still compiles against an SDK that lacks the property.
+        let subtitle = call.getString("subtitle")
+        if #available(iOS 26.0, *), navItem.responds(to: NSSelectorFromString("setSubtitle:")) {
+            navItem.setValue(subtitle, forKey: "subtitle")
+        } else {
+            navItem.prompt = subtitle
+        }
+        if #available(iOS 11.0, *) {
+            navItem.largeTitleDisplayMode = large ? .always : .never
+        }
+
+        navbarItemPlacement.removeAll()
+        navbarItemTitle.removeAll()
+
+        // Not on the very first bar of a launch: there is nothing to cross-fade
+        // from, and animating would show the buttons arriving over a cold start
+        // that is already busy enough.
+        let animated = hasSetNavbarItems
+        hasSetNavbarItems = true
+
+        if let backButton = call.getObject("backButton"), backButton["visible"] as? Bool == true {
+            let title = backButton["title"] as? String
+            let item = UIBarButtonItem(title: title ?? "Back", style: .plain, target: self, action: #selector(self.handleNavbarBack))
+            configureGlassBarButtonItem(item, id: "back")
+            navItem.setLeftBarButtonItems([item], animated: animated)
+        } else {
+            navItem.setLeftBarButtonItems(
+                makeBarButtonItems(call.getArray("leftItems") as? [[String: Any]] ?? [], placement: "left"),
+                animated: animated
+            )
+        }
+
+        // The animated setters, not a plain assignment: UIKit cross-fades the
+        // glass buttons in and out, which is what the material is built for.
+        // Assigning the arrays swaps them between two frames instead, and a
+        // button that simply ceases to exist reads as a glitch rather than as
+        // something making way — most visibly when a dialog opens and the
+        // page's buttons give up the bar to a close button.
+        navItem.setRightBarButtonItems(
+            makeBarButtonItems(call.getArray("rightItems") as? [[String: Any]] ?? [], placement: "right"),
+            animated: animated
+        )
+    }
+
+    /// Takes down the snapshot a tab switch left covering the web view.
+    ///
+    /// Called by the web app once it has navigated and drawn. A timeout guards
+    /// the case where it never does — a snapshot that outlived its page would
+    /// be a frozen screen, which is worse than the flicker it prevents.
+    @objc func finishTabTransition(_ call: CAPPluginCall) {
+        DispatchQueue.main.async {
+            // The selected tab is uncovered. The tab being left keeps its
+            // still until it has faded out — viewDidDisappear drops it — so
+            // the dissolve ends on the new page rather than on a blank.
+            // Anything already off screen is only cleaned up.
+            let selected = self.hostedContentController()
+            NativeNavigationTabContentController.all.forEach { controller in
+                if controller === selected || controller.viewIfLoaded?.window == nil {
+                    controller.revealHostedWebView()
+                }
+            }
+            call.resolve()
         }
     }
 
@@ -198,6 +374,14 @@ public class NativeNavigationPlugin: CAPPlugin, CAPBridgedPlugin, UITabBarContro
                 self.updateInsetsAndNotify()
                 call.resolve(self.insetsResult())
                 return
+            }
+
+            if let background = call.getString("contentBackground").flatMap({ UIColor(hex: $0) }) {
+                NativeNavigationTabContentController.contentBackground = background
+                // Controllers built by an earlier call keep the colour they were
+                // created with, so they are repainted here too.
+                NativeNavigationTabContentController.all
+                    .forEach { $0.viewIfLoaded?.backgroundColor = background }
             }
 
             let hidden = call.getBool("hidden", false)
@@ -221,17 +405,35 @@ public class NativeNavigationPlugin: CAPPlugin, CAPBridgedPlugin, UITabBarContro
 
             if self.usesSystemLiquidGlass && self.tabbarStyle.shape != .curve {
                 let tabBar = self.ensureTabBar()
-                let (items, selectedIndex) = self.makeTabBarItems(
-                    tabs,
-                    selectedId: selectedId,
-                    labelVisibilityMode: labelVisibilityMode,
-                    icons: icons
-                )
                 self.floatingTabBar?.isHidden = true
                 self.tabContainer?.isHidden = true
-                self.applySystemTabBarItems(items, selectedIndex: selectedIndex, animated: call.getBool("animated", false))
+
+                // iOS 18 replaced UITabBarItem + setViewControllers with UITab,
+                // and only that family can carry a UISearchTab — the thing that
+                // makes the bar morph into a search field instead of leaving it
+                // to the app to open a page of its own.
+                var builtEmpty: Bool
+                if #available(iOS 18.0, *) {
+                    let (built, selectedIndex) = self.makeSystemTabs(
+                        tabs,
+                        selectedId: selectedId,
+                        labelVisibilityMode: labelVisibilityMode,
+                        icons: icons
+                    )
+                    self.applySystemTabs(built, selectedIndex: selectedIndex)
+                    builtEmpty = built.isEmpty
+                } else {
+                    let (items, selectedIndex) = self.makeTabBarItems(
+                        tabs,
+                        selectedId: selectedId,
+                        labelVisibilityMode: labelVisibilityMode,
+                        icons: icons
+                    )
+                    self.applySystemTabBarItems(items, selectedIndex: selectedIndex, animated: call.getBool("animated", false))
+                    builtEmpty = items.isEmpty
+                }
                 self.applyTabBarAppearance(tabBar: tabBar, options: call)
-                if items.isEmpty {
+                if builtEmpty {
                     self.tabbarVisible = false
                     self.hideSystemTabBarChromeCompletely()
                 } else {
@@ -310,6 +512,22 @@ public class NativeNavigationPlugin: CAPPlugin, CAPBridgedPlugin, UITabBarContro
             snapshot.isOpaque = true
             snapshot.layer.cornerRadius = cornerRadius
             snapshot.clipsToBounds = cornerRadius > 0
+            // On top while the route swaps underneath, whatever the direction,
+            // and the web view itself is left exactly as it is: not dimmed,
+            // not hidden. WebKit records the snapshot it later reveals behind
+            // a back swipe at `pushState` time, by rendering the WKWebView's
+            // own layer — and the router pushes the URL while this transition
+            // is in flight. A web view dimmed to `alpha = 0.01` here was
+            // captured at 1 % and stored in a format without alpha, so every
+            // swipe revealed the previous page as a faint ghost on black. An
+            // opaque sibling on top hides the swap just as well and is
+            // invisible to that capture.
+            //
+            // Layering still decides which page appears to move over the
+            // other — a push slides the incoming page in on top, a pop slides
+            // the outgoing one away on top — but for a push that only matters
+            // once the animation starts, so finishStandardTransition drops the
+            // snapshot below the web view right before animating.
             transitionContainer.insertSubview(snapshot, aboveSubview: webView)
             self.bringChromeToFront()
             self.transitionSnapshot = snapshot
@@ -317,7 +535,6 @@ public class NativeNavigationPlugin: CAPPlugin, CAPBridgedPlugin, UITabBarContro
             self.activeTransitionDirection = direction
             self.activeZoomSourceFrame = zoomSourceFrame
             self.activeZoomCornerRadius = cornerRadius
-            webView.alpha = 0.01
 
             let event: [String: Any] = ["id": transitionId, "direction": direction, "duration": durationMs]
             self.notifyListeners("transitionStart", data: event)
@@ -366,23 +583,45 @@ public class NativeNavigationPlugin: CAPPlugin, CAPBridgedPlugin, UITabBarContro
         let width = transition.webView.bounds.width
         let transforms = standardTransitionTransforms(direction: transition.direction, width: width)
         let usesStationaryCrossfade = nativeNavigationUsesStationaryTransitionCrossfade(direction: transition.direction)
-        transition.webView.transform = transforms.start
-        transition.webView.alpha = usesStationaryCrossfade ? 1 : 0.01
 
-        UIView.animate(
-            withDuration: max(transition.duration, 0),
-            delay: 0,
-            options: [.curveEaseOut, .allowUserInteraction],
-            animations: {
-                transition.webView.transform = .identity
-                transition.webView.alpha = 1
-                transition.snapshot?.transform = transforms.snapshotEnd
-                transition.snapshot?.alpha = usesStationaryCrossfade ? 0 : 0.75
-            },
-            completion: { _ in
-                self.finishTransitionCleanup(transition)
-            }
+        // A push slides the incoming page in over the outgoing one, so the
+        // snapshot goes underneath now — in the same transaction as the start
+        // transform, so no frame shows the live page before it has moved off
+        // screen. Until here it stayed on top; see beginTransition for why.
+        let isPush = transition.direction != "back" && !usesStationaryCrossfade
+        if isPush, let snapshot = transition.snapshot, let container = snapshot.superview {
+            container.insertSubview(snapshot, belowSubview: transition.webView)
+        }
+
+        transition.webView.transform = transforms.start
+        // Fully opaque while sliding. The old 0.01 start faded the incoming
+        // page in, and with the outgoing snapshot also translucent both pages
+        // were visible through each other for the whole animation. Only the
+        // stationary directions ('none', 'tab', 'root') are a crossfade, and
+        // there the snapshot does the fading.
+        transition.webView.alpha = 1
+
+        // A critically damped spring rather than `.curveEaseOut`.
+        //
+        // easeOut starts at full speed and coasts to a stop, which is what made
+        // the push read as "a web animation" rather than as iOS. UIKit's own
+        // push eases in as well as out and settles rather than stopping; a
+        // spring with dampingRatio 1 is that shape without overshoot.
+        let animator = UIViewPropertyAnimator(
+            duration: max(transition.duration, 0.01),
+            timingParameters: UISpringTimingParameters(dampingRatio: 1.0)
         )
+        animator.isUserInteractionEnabled = true
+        animator.addAnimations {
+            transition.webView.transform = .identity
+            transition.webView.alpha = 1
+            transition.snapshot?.transform = transforms.snapshotEnd
+            transition.snapshot?.alpha = usesStationaryCrossfade ? 0 : 0.75
+        }
+        animator.addCompletion { _ in
+            self.finishTransitionCleanup(transition)
+        }
+        animator.startAnimation()
     }
 
     private func standardTransitionTransforms(direction: String, width: CGFloat) -> (start: CGAffineTransform, snapshotEnd: CGAffineTransform) {
@@ -549,9 +788,33 @@ public class NativeNavigationPlugin: CAPPlugin, CAPBridgedPlugin, UITabBarContro
             hostWebViewInSelectedSystemTab()
             return
         }
-        let index = viewController.tabBarItem.tag
+        // `tabBarItem.tag` is only set by the pre-iOS-18 path. Tabs built as
+        // UITab carry no tag, so it reads 0 and every tap would report the
+        // first tab. `selectedIndex` matches the order tabIds was built in.
+        let index = appliedSystemTabIds.isEmpty ? viewController.tabBarItem.tag : tabBarController.selectedIndex
         hostWebViewInSelectedSystemTab()
         notifyTabSelect(index: index)
+    }
+
+    /// Selection callback for the iOS 18+ `tabs` API.
+    ///
+    /// The legacy `didSelect viewController:` above is not guaranteed to fire
+    /// once a controller is driven by `tabs` rather than `viewControllers`,
+    /// and when it does not fire nothing moves the WebView into the newly
+    /// selected tab — every tab but the first shows an empty screen, and the
+    /// web layer never learns a tab was tapped.
+    @available(iOS 18.0, *)
+    public func tabBarController(
+        _ tabBarController: UITabBarController,
+        didSelectTab selectedTab: UITab,
+        previousTab: UITab?
+    ) {
+        hostWebViewInSelectedSystemTab()
+
+        guard !suppressTabSelectEvent else {
+            return
+        }
+        notifyTabSelect(index: tabBarController.selectedIndex)
     }
 
     private func notifyTabSelect(index: Int) {
@@ -875,24 +1138,48 @@ public class NativeNavigationPlugin: CAPPlugin, CAPBridgedPlugin, UITabBarContro
         }
     }
 
-    private func setSystemTabBarHidden(_ hidden: Bool) {
+    /// How long UIKit's animated `setTabBarHidden(_:animated:)` takes.
+    ///
+    /// That API has no completion handler, so the teardown in
+    /// `hideSystemTabBarChromeCompletely` is deferred by this much instead.
+    /// Deliberately a touch generous: finishing early cuts the slide off, while
+    /// finishing late costs nothing but an invisible bar staying in the
+    /// hierarchy a moment longer.
+    private static let animatedTabBarHideDuration: TimeInterval = 0.35
+
+    private func setSystemTabBarHidden(_ hidden: Bool, animated: Bool = false) {
         guard let tabBarController = tabBarController else {
             return
         }
 
         let tabBar = tabBarController.tabBar
         if #available(iOS 18.0, *) {
-            tabBarController.setTabBarHidden(hidden, animated: false)
+            tabBarController.setTabBarHidden(hidden, animated: animated)
         } else {
             tabBar.isHidden = hidden
         }
 
-        if hidden {
-            setTabBarBackgroundSubviewsHidden(true, on: tabBar)
-        } else {
-            setTabBarBackgroundSubviewsHidden(false, on: tabBar)
-            tabBar.setNeedsLayout()
-            tabBar.layoutIfNeeded()
+        // iOS 26 owns the tab bar's subviews itself — the minimized pill is
+        // one of them. setTabBarBackgroundSubviewsHidden walks every subview
+        // and forces isHidden/alpha, which resurrected the pill's icon over
+        // the first tab after a minimize. So on 26 the sweep is skipped in
+        // BOTH directions: setTabBarHidden above is the whole mechanism, and
+        // touching it from only one side leaves the bar permanently empty.
+        guard #available(iOS 26.0, *) else {
+            if hidden {
+                // Skipped while animating: this zeroes the alpha of the bar
+                // and of every subview, so running it now would empty the bar
+                // before it has moved anywhere. The deferred teardown calls
+                // this again.
+                if !animated {
+                    setTabBarBackgroundSubviewsHidden(true, on: tabBar)
+                }
+            } else {
+                setTabBarBackgroundSubviewsHidden(false, on: tabBar)
+                tabBar.setNeedsLayout()
+                tabBar.layoutIfNeeded()
+            }
+            return
         }
     }
 
@@ -906,7 +1193,43 @@ public class NativeNavigationPlugin: CAPPlugin, CAPBridgedPlugin, UITabBarContro
         }
     }
 
-    private func hideSystemTabBarChromeCompletely() {
+    private func hideSystemTabBarChromeCompletely(animated: Bool = false) {
+        // On iOS 26 the bar is hidden and nothing else: the teardown would pull
+        // the web view back out of the tab controller, and with it the
+        // navigation controller the article bar hangs off — so the one screen
+        // that needs a real bar would be the one screen without one.
+        // `setTabBarHidden` is the entire mechanism there anyway; it drops the
+        // bar out of the safe area too, so nothing stays reserved.
+        if usesSystemLiquidGlass, tabbarStyle.shape != .curve, tabBarController != nil {
+            setSystemTabBarHidden(true, animated: animated)
+            return
+        }
+
+        // The teardown below cannot simply be animated in place. Its first step
+        // empties the bar AND moves the WebView back out of the tab controller,
+        // so by the time UIKit would animate there is nothing left to slide.
+        // Animating therefore means: slide first, tear down afterwards.
+        guard animated,
+              #available(iOS 18.0, *),
+              let tabBarController = tabBarController,
+              !tabBarController.view.isHidden else {
+            tearDownSystemTabBarChrome()
+            return
+        }
+
+        setSystemTabBarHidden(true, animated: true)
+
+        DispatchQueue.main.asyncAfter(deadline: .now() + Self.animatedTabBarHideDuration) { [weak self] in
+            // A setTabbar({hidden: false}) may have landed while the bar was
+            // sliding out. `tabbarVisible` is written before the chrome is
+            // touched, so it is the authority on what the caller wants now —
+            // tearing down here would break a bar that is on its way back in.
+            guard let self, !self.tabbarVisible else { return }
+            self.tearDownSystemTabBarChrome()
+        }
+    }
+
+    private func tearDownSystemTabBarChrome() {
         applySystemTabBarItems([], selectedIndex: nil, animated: false)
         setSystemTabBarHidden(true)
         tabBarController?.view.isHidden = true
@@ -916,7 +1239,7 @@ public class NativeNavigationPlugin: CAPPlugin, CAPBridgedPlugin, UITabBarContro
 
     private func hideTabBarChrome() {
         if usesSystemLiquidGlass && tabbarStyle.shape != .curve {
-            hideSystemTabBarChromeCompletely()
+            hideSystemTabBarChromeCompletely(animated: true)
         } else {
             restoreWebViewFromSystemTabController()
             hideSystemTabBarChromeCompletely()
@@ -929,7 +1252,12 @@ public class NativeNavigationPlugin: CAPPlugin, CAPBridgedPlugin, UITabBarContro
         floatingTabBar?.isHidden = true
         tabBarController?.view.isHidden = false
         if usesSystemLiquidGlass && tabbarStyle.shape != .curve {
-            setSystemTabBarHidden(false)
+            // Animated, to match hideTabBarChrome() on the way out: hiding slid
+            // the bar away while showing snapped it back, so a dialog closing
+            // looked like the dock reappearing out of nowhere. Not on the first
+            // bar of a launch — there is nothing to slide back from.
+            setSystemTabBarHidden(false, animated: hasShownTabBar)
+            hasShownTabBar = true
             liftWebViewOverlaysAboveSystemTabs()
             hostWebViewInSelectedSystemTab()
         } else {
@@ -995,15 +1323,68 @@ public class NativeNavigationPlugin: CAPPlugin, CAPBridgedPlugin, UITabBarContro
         hostWebView(in: tabBarController?.selectedViewController)
     }
 
-    private func hostWebView(in viewController: UIViewController?) {
-        guard usesSystemLiquidGlass,
-              let webView = webView,
-              let selectedController = viewController as? NativeNavigationTabContentController else {
+    /// Turns on Apple's own scroll edge effect for content passing under the
+    /// bars.
+    ///
+    /// This is the piece that makes a floating bar readable, and it belongs to
+    /// the scroll view rather than to the bar: `topEdgeEffect` runs inside the
+    /// scroll view's own compositing, so it needs no access to the web view's
+    /// pixels from the outside.
+    ///
+    /// `.soft` is the fading blur; the other style is a hard line, which is
+    /// what an unstyled edge looks like.
+    ///
+    /// - Parameter webView: The hosted web view, whose scrollView carries the
+    ///   effect.
+    private func applyScrollEdgeEffects(to webView: UIView) {
+        guard #available(iOS 26.0, *), let scrollView = (webView as? WKWebView)?.scrollView else {
             return
         }
 
+        scrollView.topEdgeEffect.style = .soft
+
+        // The style alone is a knob attached to nothing until UIKit knows which
+        // scroll view sits under the bar. It can usually find one itself, but
+        // not here: the web view is moved in and out of the content controller
+        // at runtime, so it is not there to be found when the bar is set up.
+        // This is what `setContentScrollView` exists for — and it has to be the
+        // controller that owns the bar, not the bridge's root.
+        (hostedContentController() ?? bridge?.viewController)?
+            .setContentScrollView(scrollView, for: .top)
+    }
+
+    /// The content controller currently showing the web view, if the web view
+    /// lives inside the tab controller at all.
+    private func hostedContentController() -> NativeNavigationTabContentController? {
+        return nativeNavigationTabContent(of: tabBarController?.selectedViewController)
+    }
+
+    private func hostWebView(in viewController: UIViewController?) {
+        let content = nativeNavigationTabContent(of: viewController)
+
+        guard usesSystemLiquidGlass,
+              let webView = webView,
+              let selectedController = content else {
+            return
+        }
+
+        applyScrollEdgeEffects(to: webView)
         liftWebViewOverlaysAboveSystemTabs()
         captureOriginalWebViewPlacementIfNeeded(webView)
+
+        // A change of host. The web view still shows the tab being left, and
+        // UIKit is about to cross-dissolve to the tab being entered, whose
+        // view may not even be attached yet. Three things keep that from
+        // showing: the bar carries over, so the safe area — and with it the
+        // page's top padding — does not jump; the new tab is covered with a
+        // still of the current page until the web app reports the new one
+        // painted; and the web view itself moves only once the new view is
+        // on screen with real bounds (see NativeNavigationTabContentController).
+        if !selectedController.isHosting(webView) {
+            carryHostedNavbar(to: selectedController)
+            selectedController.cover(with: webView)
+        }
+
         clearHostedWebViews(matching: webView, except: selectedController, preservingSnapshots: true)
         guard selectedController.host(webView: webView) else {
             isWebViewHostedInSystemTabController = false
@@ -1062,8 +1443,7 @@ public class NativeNavigationPlugin: CAPPlugin, CAPBridgedPlugin, UITabBarContro
         except owner: NativeNavigationTabContentController? = nil,
         preservingSnapshots: Bool = false
     ) {
-        tabViewControllers
-            .compactMap { $0 as? NativeNavigationTabContentController }
+        NativeNavigationTabContentController.all
             .filter { $0 !== owner }
             .forEach { $0.clearHostedWebView(ifMatching: webView, preservingSnapshot: preservingSnapshots) }
     }
@@ -1072,19 +1452,286 @@ public class NativeNavigationPlugin: CAPPlugin, CAPBridgedPlugin, UITabBarContro
         return rawItems.map { rawItem in
             let id = rawItem["id"] as? String ?? UUID().uuidString
             let title = rawItem["title"] as? String
-            let image = image(from: rawItem["icon"] as? [String: Any])
+            var image = image(from: rawItem["icon"] as? [String: Any])
+            let tint = (rawItem["tintColor"] as? String).flatMap { UIColor(hex: $0) }
+            // A dot in the corner, for "there is something waiting here". UIKit
+            // gives bar buttons no badge of their own, so it is drawn into the
+            // image — which means baking the tint in as well, since a template
+            // image would flatten the dot into the symbol's own colour.
+            if let badge = (rawItem["badgeColor"] as? String).flatMap({ UIColor(hex: $0) }),
+               let base = image {
+                image = badged(base, tint: tint ?? .label, badge: badge)
+            }
             let item = UIBarButtonItem(image: image, style: .plain, target: self, action: #selector(handleNavbarButton(_:)))
             if image == nil {
                 item.title = title
             }
             item.isEnabled = rawItem["enabled"] as? Bool ?? true
+            // A colour of the item's own, where inheriting the bar's tint would
+            // lose meaning the colour itself carries — a streak flame reads as
+            // a flame because it is orange.
+            if let tint = rawItem["tintColor"] as? String, let colour = UIColor(hex: tint) {
+                item.tintColor = colour
+            }
             item.accessibilityIdentifier = id
             item.accessibilityLabel = title
             configureGlassBarButtonItem(item, id: id)
             navbarItemPlacement[id] = placement
             navbarItemTitle[id] = title ?? ""
+
+            // A `menu` turns the button into an anchored UIMenu instead of a
+            // plain tap. Without it the only way to offer several commands from
+            // the bar is a sheet in the middle of the screen, which is not what
+            // an ellipsis promises on iOS: the menu belongs at the button.
+            //
+            // Children report through the same navbarItemTap event as any
+            // button, so the web layer handles them identically.
+            if let entries = rawItem["menu"] as? [[String: Any]], !entries.isEmpty {
+                item.menu = makeBarButtonMenu(entries)
+                // The target/action has to go, or UIKit treats the tap as that
+                // action and only opens the menu on a long press — which reads
+                // as an ellipsis that does nothing, since the button's own id
+                // matches no command.
+                item.target = nil
+                item.action = nil
+            }
+
             return item
         }
+    }
+
+    /// Builds the menu shown by a bar button that declares `menu` entries.
+    ///
+    /// - Parameter entries: Raw dictionaries with `id`, `title` and optional
+    ///   `icon` and `destructive` keys.
+    /// - Returns: A menu whose actions each notify `navbarItemTap`.
+    private func makeBarButtonMenu(_ entries: [[String: Any]]) -> UIMenu {
+        return UIMenu(title: "", children: makeMenuElements(entries))
+    }
+
+    /// One `UIMenuElement` per entry: an action, or — for an entry with
+    /// `children` — a submenu of them, the way the appearance picker nests in
+    /// the profile menu. `checked` ticks an action, for the option in force.
+    private func makeMenuElements(_ entries: [[String: Any]]) -> [UIMenuElement] {
+        var elements: [UIMenuElement] = []
+
+        // A plain loop with spelled-out types. As a map closure this stopped
+        // type-checking altogether — "failed to produce diagnostic" — which is
+        // the compiler giving up on inference rather than a fault in the code.
+        for entry in entries {
+            let id: String = entry["id"] as? String ?? UUID().uuidString
+            let title: String = entry["title"] as? String ?? ""
+            let iconImage: UIImage? = image(from: entry["icon"] as? [String: Any])
+
+            if let children = entry["children"] as? [[String: Any]] {
+                elements.append(UIMenu(title: title, image: iconImage, children: makeMenuElements(children)))
+                continue
+            }
+
+            let destructive: Bool = entry["destructive"] as? Bool ?? false
+            let enabled: Bool = entry["enabled"] as? Bool ?? true
+            let checked: Bool = entry["checked"] as? Bool ?? false
+
+            var attributes: UIMenuElement.Attributes = []
+            if destructive {
+                attributes.insert(.destructive)
+            }
+            if !enabled {
+                attributes.insert(.disabled)
+            }
+            // An attribute, not a property on UIAction. Steppers need the menu
+            // to survive the tap: a font size is set by pressing repeatedly,
+            // and a menu that closes each time would have to be reopened for
+            // every step.
+            if #available(iOS 16.0, *), entry["keepsMenuOpen"] as? Bool == true {
+                attributes.insert(.keepsMenuPresented)
+            }
+
+            let handler: UIActionHandler = { [weak self] _ in
+                self?.notifyListeners("navbarItemTap", data: ["id": id])
+            }
+
+            let action = UIAction(
+                title: title,
+                image: iconImage,
+                identifier: nil,
+                discoverabilityTitle: nil,
+                attributes: attributes,
+                state: checked ? .on : .off,
+                handler: handler
+            )
+
+            elements.append(action)
+        }
+
+        return elements
+    }
+
+    /// Builds the iOS 18+ tab objects, keeping `tabIds`/`tabTitles` in the same
+    /// order the old `makeTabBarItems` produced so `notifyTabSelect(index:)`
+    /// and the existing delegate plumbing keep working unchanged.
+    ///
+    /// The `search` role becomes a real `UISearchTab` here rather than a
+    /// `UITabBarItem(tabBarSystemItem: .search)` dressed up to look like one.
+    /// That is the whole point: the system draws it detached and circular, and
+    /// morphs it into a search field when selected.
+    @available(iOS 18.0, *)
+    private func makeSystemTabs(
+        _ tabs: [[String: Any]],
+        selectedId: String?,
+        labelVisibilityMode: String,
+        icons: Bool
+    ) -> ([UITab], Int?) {
+        tabIds = []
+        tabTitles = []
+        tabDisplayTitles = []
+        tabBaseImages = []
+        tabSelectedImages = []
+
+        var built: [UITab] = []
+        var selectedIndex: Int?
+
+        for (sourceIndex, tab) in tabs.enumerated() {
+            let id = tab["id"] as? String ?? "tab-\(sourceIndex)"
+            let isHidden = tab["hidden"] as? Bool ?? false
+            if isHidden && id != selectedId {
+                continue
+            }
+
+            let rawTitle = tab["title"] as? String ?? ""
+            let title = tabTitle(
+                rawTitle,
+                id: id,
+                index: built.count,
+                selectedId: selectedId,
+                labelVisibilityMode: labelVisibilityMode
+            )
+            let image = icons ? self.image(from: tab["icon"] as? [String: Any]) : nil
+            let role = (tab["role"] as? String)?.lowercased()
+
+            let entry: UITab
+            if role == "search" {
+                // Copy comes from the web layer, where the app's German lives.
+                // Without it UIKit falls back to its own localized "Search",
+                // which is English here because the bundle declares no German.
+                let placeholder = tab["searchPlaceholder"] as? String
+                let searchTab = UISearchTab { [weak self] _ in
+                    self?.makeSearchTabController(placeholder: placeholder) ?? UIViewController()
+                }
+                // Left off deliberately: with it on, UIKit presents the search
+                // controller the moment the tab is selected, and presenting one
+                // hides the tab bar — which is exactly the morph we want to
+                // watch. The field is one tap away either way.
+                //
+                // iOS 26 only, despite UISearchTab itself dating to 18.
+                if #available(iOS 26.0, *) {
+                    searchTab.automaticallyActivatesSearch = true
+                }
+                entry = searchTab
+            } else {
+                entry = UITab(title: title ?? "", image: image, identifier: id) { _ in
+                    nativeNavigationMakeTabContent()
+                }
+            }
+
+            if id == selectedId {
+                selectedIndex = built.count
+            }
+
+            tabIds.append(id)
+            tabTitles.append(rawTitle)
+            tabDisplayTitles.append(title)
+            built.append(entry)
+        }
+
+        return (built, selectedIndex)
+    }
+
+    /// The search tab's content: a normal tab content controller (so the
+    /// WebView can move into it like it does for every other tab) inside a
+    /// navigation controller (so it has a `navigationItem` to hang the search
+    /// controller off).
+    @available(iOS 18.0, *)
+    private func makeSearchTabController(placeholder: String?) -> UIViewController {
+        let content = NativeNavigationTabContentController()
+        let search = UISearchController(searchResultsController: nil)
+        search.obscuresBackgroundDuringPresentation = false
+        if let placeholder = placeholder, !placeholder.isEmpty {
+            search.searchBar.placeholder = placeholder
+        }
+
+        let updater = NativeNavigationSearchQueryForwarder(
+            onQueryChange: { [weak self] query in
+                self?.notifyListeners("searchQueryChanged", data: ["query": query])
+            },
+            onSubmit: { [weak self] query in
+                self?.notifyListeners("searchSubmit", data: ["query": query])
+            }
+        )
+        search.searchResultsUpdater = updater
+        search.searchBar.delegate = updater
+        // The forwarder is only weakly held by UISearchController, so the
+        // controller has to keep it alive itself.
+        content.searchQueryForwarder = updater
+
+        content.navigationItem.searchController = search
+        if #available(iOS 26.0, *) {
+            content.navigationItem.preferredSearchBarPlacement = .integrated
+        }
+
+        let navigation = UINavigationController(rootViewController: content)
+
+        // The navigation bar stays. `navigationItem.searchController` is
+        // surfaced BY that bar, so hiding it leaves the navigation item inert —
+        // no search field, and no tab bar morphing into one. Hiding it was the
+        // single difference between this and the isolated probe where the morph
+        // worked, and it cost exactly that.
+        //
+        // Transparent and empty instead, which costs nothing visually: with
+        // `.integrated` placement the field belongs at the bottom, the bar
+        // carries no title, and the WebView draws straight through it.
+        let appearance = UINavigationBarAppearance()
+        appearance.configureWithTransparentBackground()
+        navigation.navigationBar.standardAppearance = appearance
+        navigation.navigationBar.scrollEdgeAppearance = appearance
+        navigation.navigationBar.compactAppearance = appearance
+
+        return navigation
+    }
+
+    /// Assigns the tabs and moves the WebView into the selected one.
+    @available(iOS 18.0, *)
+    private func applySystemTabs(_ built: [UITab], selectedIndex: Int?) {
+        guard let tabBarController = tabBarController else {
+            return
+        }
+
+        suppressTabSelectEvent = true
+        defer { suppressTabSelectEvent = false }
+
+        guard !built.isEmpty else {
+            restoreWebViewFromSystemTabController()
+            tabBarController.tabs = []
+            appliedSystemTabIds = []
+            tabViewControllers = []
+            return
+        }
+
+        // Only rebuild when the set actually changed. A re-push that merely
+        // moves the selection must leave the existing tabs alone.
+        if tabIds != appliedSystemTabIds || tabBarController.tabs.count != built.count {
+            tabBarController.tabs = built
+            appliedSystemTabIds = tabIds
+        }
+
+        let index = min(max(selectedIndex ?? tabBarController.selectedIndex, 0), built.count - 1)
+        tabBarController.selectedIndex = index
+
+        // `tabs` creates its view controller lazily, so this has to happen
+        // after the selection, not before it.
+        hostWebView(in: tabBarController.selectedViewController)
+
+        tabViewControllers = tabBarController.viewControllers ?? []
     }
 
     private func makeTabBarItems(
@@ -1268,6 +1915,19 @@ public class NativeNavigationPlugin: CAPPlugin, CAPBridgedPlugin, UITabBarContro
             return template ? image.withRenderingMode(.alwaysTemplate) : image
         }
         if let src = descriptor["src"] as? String {
+            // A raster passed inline as a data: URI. The renderer above only
+            // speaks SVG, and UIImage(named:) only reads what is bundled with
+            // the app, so a picture the app fetched at runtime — a user's
+            // avatar — had no way in at all.
+            if let image = rasterImage(fromDataURI: src, descriptor: descriptor) {
+                // .alwaysOriginal, not merely "not template": a UIBarButtonItem
+                // treats an image whose mode is .automatic as a template and
+                // fills it with the bar's tint, which turned the avatar into a
+                // flat dark disc. Only the explicit mode keeps its colours.
+                return template
+                    ? image.withRenderingMode(.alwaysTemplate)
+                    : image.withRenderingMode(.alwaysOriginal)
+            }
             if let svg = inlineSVG(from: src),
                let image = SVGIconRenderer.render(svg: svg, size: iconSize(from: descriptor)) {
                 return template ? image.withRenderingMode(.alwaysTemplate) : image
@@ -1311,6 +1971,75 @@ public class NativeNavigationPlugin: CAPPlugin, CAPBridgedPlugin, UITabBarContro
             return String(data: data, encoding: .utf8)
         }
         return payload.removingPercentEncoding
+    }
+
+    /// Decodes a `data:image/...;base64,...` URI into an image sized for a bar
+    /// button, optionally masked into a circle.
+    ///
+    /// Returns nil for anything that is not such a URI, so the caller can fall
+    /// through to the SVG and bundled-asset branches unchanged.
+    ///
+    /// The redraw is not optional: a bar button shows an image at its natural
+    /// size, and an avatar arrives at whatever resolution its source had.
+    private func rasterImage(fromDataURI src: String, descriptor: [String: Any]) -> UIImage? {
+        guard src.hasPrefix("data:image/"),
+              let commaIndex = src.firstIndex(of: ","),
+              src[src.startIndex..<commaIndex].hasSuffix(";base64") else {
+            return nil
+        }
+
+        let encoded = String(src[src.index(after: commaIndex)...])
+        guard let data = Data(base64Encoded: encoded, options: .ignoreUnknownCharacters),
+              let decoded = UIImage(data: data) else {
+            return nil
+        }
+
+        let size = iconSize(from: descriptor)
+        let isCircular = descriptor["circular"] as? Bool ?? false
+        let format = UIGraphicsImageRendererFormat.default()
+        format.opaque = false
+
+        return UIGraphicsImageRenderer(size: size, format: format).image { _ in
+            let bounds = CGRect(origin: .zero, size: size)
+            if isCircular {
+                UIBezierPath(ovalIn: bounds).addClip()
+            }
+            decoded.draw(in: bounds)
+        }
+    }
+
+    /// Draws `base` in `tint` with a filled dot in its top-right corner.
+    ///
+    /// The result is an original-mode image: it carries two colours, and a
+    /// template would discard both.
+    private func badged(_ base: UIImage, tint: UIColor, badge: UIColor) -> UIImage {
+        let inset = base.size.width * 0.08
+        let size = CGSize(width: base.size.width + inset, height: base.size.height + inset)
+        let diameter = max(base.size.width * 0.34, 6)
+
+        let format = UIGraphicsImageRendererFormat.default()
+        format.opaque = false
+
+        return UIGraphicsImageRenderer(size: size, format: format).image { context in
+            tint.setFill()
+            base.withRenderingMode(.alwaysTemplate)
+                .draw(in: CGRect(x: 0, y: inset, width: base.size.width, height: base.size.height))
+
+            // A ring of clear around the dot, so it reads as separate from the
+            // symbol rather than as part of its silhouette.
+            let dot = CGRect(
+                x: size.width - diameter,
+                y: 0,
+                width: diameter,
+                height: diameter
+            )
+            context.cgContext.setBlendMode(.clear)
+            context.cgContext.fillEllipse(in: dot.insetBy(dx: -1.5, dy: -1.5))
+            context.cgContext.setBlendMode(.normal)
+
+            badge.setFill()
+            context.cgContext.fillEllipse(in: dot)
+        }.withRenderingMode(.alwaysOriginal)
     }
 
     private func iconSize(from descriptor: [String: Any]) -> CGSize {
@@ -1422,7 +2151,19 @@ public class NativeNavigationPlugin: CAPPlugin, CAPBridgedPlugin, UITabBarContro
     private func applyNavBarAppearance(navBar: UINavigationBar, options call: CAPPluginCall) {
         let appearance = UINavigationBarAppearance()
         let transparent = call.getBool("transparent", false)
-        if usesSystemLiquidGlass {
+        if usesSystemLiquidGlass && transparent {
+            appearance.configureWithTransparentBackground()
+            appearance.backgroundColor = .clear
+            appearance.backgroundEffect = nil
+            appearance.shadowColor = .clear
+            navBlurView?.isHidden = true
+        } else if usesSystemLiquidGlass {
+            // Still transparent, and not for lack of trying: a
+            // UIVisualEffectView cannot blur WKWebView content. The web view
+            // renders out of process and hands UIKit a remote layer, so there
+            // is nothing behind the effect view to sample and the result is a
+            // flat tint. The article page draws its own backdrop-filter scrim
+            // instead, inside the web view where the blur works.
             appearance.configureWithTransparentBackground()
             appearance.backgroundColor = .clear
             appearance.backgroundEffect = nil
@@ -1779,6 +2520,17 @@ public class NativeNavigationPlugin: CAPPlugin, CAPBridgedPlugin, UITabBarContro
         guard let rootView = bridge?.viewController?.view else {
             return
         }
+
+        // Applied here rather than from hostWebView, which only runs while the
+        // web view lives inside a tab's content controller. On the article page
+        // the tab bar is hidden, which pulls the web view back out again — so
+        // the one screen that needs the effect most was the one screen that
+        // never got it. layoutChrome runs on every chrome change, and setting
+        // the style is idempotent.
+        if let webView = webView {
+            applyScrollEdgeEffects(to: webView)
+        }
+
         rootView.layoutIfNeeded()
         let safeInsets = rootView.safeAreaInsets
         let width = rootView.bounds.width
@@ -1958,7 +2710,12 @@ public class NativeNavigationPlugin: CAPPlugin, CAPBridgedPlugin, UITabBarContro
 
     private func currentInsets() -> [String: Any] {
         let safeInsets = bridge?.viewController?.view.safeAreaInsets ?? .zero
-        let navHeight = isEnabled && navbarVisible ? navbarHeight + safeInsets.top : 0
+        // The hosted bar is inside the web view's own safe area, so the page
+        // already reserves it through env(safe-area-inset-top); reporting the
+        // height here as well would reserve the strip twice.
+        let navHeight = isEnabled && navbarVisible && !navbarUsesHostedController
+            ? navbarHeight + safeInsets.top
+            : 0
         let usesSystemTabbar = usesSystemLiquidGlass && tabbarStyle.shape != .curve
         let nativeTabHeight = max(tabBar?.frame.height ?? 0, 49 + safeInsets.bottom)
         let customTabHeight = tabbarHeight + safeInsets.bottom + tabbarStyle.bottomGap
@@ -2583,8 +3340,26 @@ func nativeNavigationLiftWebViewOverlaySubviews(
     tracking liftedOverlays: inout [NativeNavigationWeakView],
     excluding excludedViews: [UIView?] = []
 ) {
+    // WebKit's own back/forward swipe (`allowsBackForwardNavigationGestures`)
+    // wraps the web view's scroll view in plain UIViews of its own for the
+    // length of the gesture — direct subviews of the web view, and by class
+    // name indistinguishable from an overlay. They are the page. Lifting the
+    // wrapper moves the live page out of the web view for good: when the
+    // gesture ends, WebKit puts the scroll view back beside the wrapper
+    // wherever that now is — above the tab controller, covering both bars —
+    // and the swipe recognizer, still on the web view, never sees a touch
+    // again. A `setTabbar` from the route change lands in that window every
+    // time, because WebKit commits the navigation on release, while the
+    // completion animation is still running.
+    let pageScrollView = (webView as? WKWebView)?.scrollView
+
     webView.subviews
-        .filter { nativeNavigationShouldLiftWebViewOverlay($0, excluding: excludedViews) }
+        .filter { view in
+            if let pageScrollView, pageScrollView.isDescendant(of: view) {
+                return false
+            }
+            return nativeNavigationShouldLiftWebViewOverlay(view, excluding: excludedViews)
+        }
         .forEach { overlay in
             let frame = overlay.convert(overlay.bounds, to: container)
             let hadParentConstraints = nativeNavigationDeactivateParentConstraints(in: webView, involving: overlay)
@@ -2634,22 +3409,146 @@ final class NativeNavigationTabController: UITabBarController {
         view.backgroundColor = .systemBackground
         view.isOpaque = true
         tabBar.isTranslucent = !UIAccessibility.isReduceTransparencyEnabled
+
+        // iOS 26: the floating capsule shrinks to a pill while the content
+        // scrolls down and grows back on the way up, so it stops sitting on
+        // top of what you are reading. UIKit drives this off the displayed
+        // content's scroll view — here the WKWebView's own.
+        if #available(iOS 26.0, *) {
+            tabBarMinimizeBehavior = .onScrollDown
+        }
     }
 }
 
+/// Turns `UISearchResultsUpdating` callbacks into a plain closure.
+///
+/// It exists as its own object because `UISearchController.searchResultsUpdater`
+/// is weak: the plugin cannot be the updater without also owning the retain
+/// cycle, and a closure alone cannot conform to the protocol.
+final class NativeNavigationSearchQueryForwarder: NSObject, UISearchResultsUpdating, UISearchBarDelegate {
+    private let onQueryChange: (String) -> Void
+    private let onSubmit: (String) -> Void
+
+    init(onQueryChange: @escaping (String) -> Void, onSubmit: @escaping (String) -> Void) {
+        self.onQueryChange = onQueryChange
+        self.onSubmit = onSubmit
+    }
+
+    func updateSearchResults(for searchController: UISearchController) {
+        onQueryChange(searchController.searchBar.text ?? "")
+    }
+
+    /// The search key on the keyboard. `UISearchResultsUpdating` reports every
+    /// keystroke but never the submit, so without this the web layer could not
+    /// tell "still typing" from "go" — and pressing search did nothing at all.
+    func searchBarSearchButtonClicked(_ searchBar: UISearchBar) {
+        onSubmit(searchBar.text ?? "")
+    }
+}
+
+/// A tab's content controller, wrapped in a navigation controller whose bar
+/// starts hidden.
+///
+/// The wrapper is what lets `setNavbar` produce a real iOS navigation bar
+/// instead of an overlay that only looks like one. It costs nothing while the
+/// bar is hidden, which is every tab except an open article.
+///
+/// A free function rather than a method: it is handed to `UITab` as an escaping
+/// closure, and capturing the plugin there would retain it through UIKit.
+func nativeNavigationMakeTabContent() -> UIViewController {
+    let navigation = UINavigationController(rootViewController: NativeNavigationTabContentController())
+    navigation.setNavigationBarHidden(true, animated: false)
+    return navigation
+}
+
+/// Digs the content controller out of whatever a tab hands back.
+///
+/// Every tab's content now sits inside a `UINavigationController`, so a plain
+/// cast finds nothing. Missing this unwrap once already cost a black screen
+/// behind the search field.
+func nativeNavigationTabContent(of viewController: UIViewController?) -> NativeNavigationTabContentController? {
+    if let content = viewController as? NativeNavigationTabContentController {
+        return content
+    }
+    return (viewController as? UINavigationController)?
+        .viewControllers.first as? NativeNavigationTabContentController
+}
+
 final class NativeNavigationTabContentController: UIViewController {
+    /// Every content controller ever made, weakly held. The plugin reaches all
+    /// of them to clear the web view out of the tab it left and to lift the
+    /// stills once the new page has painted, and it cannot take the list from
+    /// the tab controller: with `tabs`, `viewControllers` does not reliably
+    /// hand back the lazily created controllers, and a cast of a tab's
+    /// navigation controller to this class finds nothing.
+    private static let registry = NSHashTable<NativeNavigationTabContentController>.weakObjects()
+
+    static var all: [NativeNavigationTabContentController] {
+        registry.allObjects
+    }
+
+    /// Strong reference to the search forwarder, which `UISearchController`
+    /// only holds weakly. Set for the search tab, nil for every other tab.
+    var searchQueryForwarder: NativeNavigationSearchQueryForwarder?
+
     private weak var hostedWebView: UIView?
+
+    /// The web view this controller takes in as soon as its view is on screen
+    /// with real bounds. Taking it in any earlier — the tab delegate fires
+    /// before UIKit has attached the new tab's view — moved it into a detached
+    /// 0×0 view: the tab it left went blank for a few frames, and WebKit laid
+    /// the page out at zero width until the first real layout.
+    private weak var pendingWebView: UIView?
+
+    /// Still of the page as it looked when the web view left this tab. Stays
+    /// in the web view's place while this tab fades out.
     private var snapshotPlaceholder: UIView?
+    private var snapshotTimeout: Timer?
+
+    /// Still of the page as it looked when the web view set out for this tab,
+    /// on top of it until the web app reports the new page painted.
+    private var transitionCover: UIView?
+
+    /// What shows for the frame between tabs, before the web view is re-hosted.
+    ///
+    /// `.systemBackground` was the default and is white in light mode, so every
+    /// tab switch flashed white over a page that is not. The web app knows its
+    /// own background and passes it with `setTabbar`.
+    static var contentBackground: UIColor = .systemBackground
+
+    override init(nibName nibNameOrNil: String?, bundle nibBundleOrNil: Bundle?) {
+        super.init(nibName: nibNameOrNil, bundle: nibBundleOrNil)
+        Self.registry.add(self)
+    }
+
+    required init?(coder: NSCoder) {
+        super.init(coder: coder)
+        Self.registry.add(self)
+    }
+
+    /// Whether the web view is here or on its way here.
+    func isHosting(_ webView: UIView) -> Bool {
+        hostedWebView === webView || pendingWebView === webView
+    }
 
     override func loadView() {
         let view = UIView()
-        view.backgroundColor = .systemBackground
+        view.backgroundColor = Self.contentBackground
         view.isOpaque = true
         self.view = view
     }
 
+    override func viewIsAppearing(_ animated: Bool) {
+        super.viewIsAppearing(animated)
+        attachPendingWebViewIfReady()
+    }
+
     override func viewDidLayoutSubviews() {
         super.viewDidLayoutSubviews()
+        attachPendingWebViewIfReady()
+        guard pendingWebView == nil else {
+            return
+        }
         guard hostedWebView?.superview === view else {
             hostedWebView = nil
             return
@@ -2657,12 +3556,19 @@ final class NativeNavigationTabContentController: UIViewController {
         hostedWebView?.frame = view.bounds
     }
 
+    override func viewDidDisappear(_ animated: Bool) {
+        super.viewDidDisappear(animated)
+        // Off screen: the still that stood in for the web view while this tab
+        // faded out has done its job, and a cover nobody lifted is stale.
+        dropStills()
+    }
+
     func clearHostedWebView(ifMatching webView: UIView? = nil, preservingSnapshot: Bool = false) {
-        guard webView == nil || hostedWebView === webView else {
+        if let webView, !isHosting(webView) {
             return
         }
 
-        if preservingSnapshot, let hostedWebView = hostedWebView, hostedWebView.superview === view {
+        if preservingSnapshot, let hostedWebView, hostedWebView.superview === view {
             let placeholder = hostedWebView.snapshotView(afterScreenUpdates: false) ?? nativeNavigationSnapshotPlaceholder(for: hostedWebView)
             placeholder.frame = hostedWebView.frame
             placeholder.autoresizingMask = [.flexibleWidth, .flexibleHeight]
@@ -2672,17 +3578,75 @@ final class NativeNavigationTabContentController: UIViewController {
         }
 
         hostedWebView = nil
+        pendingWebView = nil
     }
 
     @discardableResult
     func host(webView: UIView) -> Bool {
         guard view !== webView, !view.isDescendant(of: webView) else {
             hostedWebView = nil
+            pendingWebView = nil
             return false
         }
 
-        snapshotPlaceholder?.removeFromSuperview()
-        snapshotPlaceholder = nil
+        hostedWebView = webView
+        guard webView.superview !== view else {
+            pendingWebView = nil
+            webView.frame = view.bounds
+            return true
+        }
+
+        // Not on screen yet, or not laid out: the web view stays where it is
+        // and comes over from viewIsAppearing / viewDidLayoutSubviews.
+        guard view.window != nil, !view.bounds.isEmpty else {
+            pendingWebView = webView
+            return true
+        }
+
+        pendingWebView = nil
+        place(webView)
+        return true
+    }
+
+    /// Lays a still of `webView`, as it renders right now, over this
+    /// controller's content, to be lifted by `revealHostedWebView`.
+    ///
+    /// Called for the tab being switched to while the web view still shows
+    /// the tab being left. UIKit cross-dissolves the two tabs; with the same
+    /// picture on both sides nothing visibly changes until the new page has
+    /// painted, and from then on the dissolve carries the new page in over
+    /// the old one — instead of an empty tab fading out and the old page
+    /// fading back in under the wrong tab.
+    func cover(with webView: UIView) {
+        guard transitionCover == nil else {
+            return
+        }
+
+        let cover = webView.snapshotView(afterScreenUpdates: false) ?? nativeNavigationSnapshotPlaceholder(for: webView)
+        cover.frame = view.bounds
+        cover.autoresizingMask = [.flexibleWidth, .flexibleHeight]
+        cover.isUserInteractionEnabled = false
+        view.addSubview(cover)
+        transitionCover = cover
+        scheduleWebViewReveal()
+    }
+
+    /// Drops whatever is covering the web view.
+    func revealHostedWebView() {
+        dropStills()
+        hostedWebView?.isHidden = false
+    }
+
+    private func attachPendingWebViewIfReady() {
+        guard let webView = pendingWebView, view.window != nil, !view.bounds.isEmpty else {
+            return
+        }
+        pendingWebView = nil
+        place(webView)
+    }
+
+    /// Puts the web view into the view, under whatever still is up.
+    private func place(_ webView: UIView) {
         hostedWebView = webView
         if webView.superview !== view {
             webView.removeFromSuperview()
@@ -2690,7 +3654,33 @@ final class NativeNavigationTabContentController: UIViewController {
         }
         webView.autoresizingMask = [.flexibleWidth, .flexibleHeight]
         webView.frame = view.bounds
-        return true
+
+        if let cover = transitionCover {
+            cover.frame = view.bounds
+            view.bringSubviewToFront(cover)
+        }
+        // A still from an earlier visit is stale; the cover, if any, is the
+        // current picture.
+        snapshotPlaceholder?.removeFromSuperview()
+        snapshotPlaceholder = nil
+    }
+
+    private func dropStills() {
+        snapshotTimeout?.invalidate()
+        snapshotTimeout = nil
+        snapshotPlaceholder?.removeFromSuperview()
+        snapshotPlaceholder = nil
+        transitionCover?.removeFromSuperview()
+        transitionCover = nil
+    }
+
+    /// Uncovers even if the web app never reports back, so a missed call
+    /// costs the flicker rather than a screen that stays frozen.
+    private func scheduleWebViewReveal() {
+        snapshotTimeout?.invalidate()
+        snapshotTimeout = Timer.scheduledTimer(withTimeInterval: 1.5, repeats: false) { [weak self] _ in
+            self?.revealHostedWebView()
+        }
     }
 }
 
@@ -3159,5 +4149,29 @@ private extension UIColor {
         default:
             return nil
         }
+    }
+}
+
+extension UIColor {
+    /// Builds a colour from `#RRGGBB` or `#RRGGBBAA`, returning nil for
+    /// anything else so a malformed value falls back to the inherited tint
+    /// rather than to an arbitrary colour.
+    convenience init?(hex: String) {
+        var digits = hex.trimmingCharacters(in: .whitespacesAndNewlines)
+        if digits.hasPrefix("#") {
+            digits.removeFirst()
+        }
+        guard digits.count == 6 || digits.count == 8,
+              let value = UInt64(digits, radix: 16) else {
+            return nil
+        }
+
+        let hasAlpha = digits.count == 8
+        let red = CGFloat((value >> (hasAlpha ? 24 : 16)) & 0xFF) / 255
+        let green = CGFloat((value >> (hasAlpha ? 16 : 8)) & 0xFF) / 255
+        let blue = CGFloat((value >> (hasAlpha ? 8 : 0)) & 0xFF) / 255
+        let alpha = hasAlpha ? CGFloat(value & 0xFF) / 255 : 1
+
+        self.init(red: red, green: green, blue: blue, alpha: alpha)
     }
 }

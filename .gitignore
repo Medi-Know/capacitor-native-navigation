@@ -1,5 +1,5 @@
 # node files
-dist
+# dist is committed on the mediknow branch: the app installs this repo from git.
 node_modules
 
 # iOS files

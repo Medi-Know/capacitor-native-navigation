@@ -90,6 +90,10 @@ export class NativeNavigationWeb extends WebPlugin implements NativeNavigationPl
     return transition;
   }
 
+  async finishTabTransition(): Promise<void> {
+    // Nothing covers the web view on the web.
+  }
+
   async finishTransition(
     options: NativeNavigationFinishTransitionOptions = {},
   ): Promise<NativeNavigationTransitionResult> {
