@@ -98,6 +98,12 @@ public class NativeNavigationPlugin: CAPPlugin, CAPBridgedPlugin, UITabBarContro
     private var tabBaseImages: [UIImage?] = []
     private var tabSelectedImages: [UIImage?] = []
     private var suppressTabSelectEvent = false
+
+    /// Index of the tab to return to when the search cancel (X) button is
+    /// tapped. Captured when the search tab is selected and restored on cancel
+    /// (KAN-751 — with automaticallyActivatesSearch off, UIKit no longer
+    /// returns to the previous tab for us).
+    private var searchPreviousTabIndex: Int?
     private var transitionSnapshot: UIView?
     private var activeTransitionId: String?
     private var activeTransitionDirection = "forward"
@@ -815,6 +821,49 @@ public class NativeNavigationPlugin: CAPPlugin, CAPBridgedPlugin, UITabBarContro
             return
         }
         notifyTabSelect(index: tabBarController.selectedIndex)
+        if selectedTab is UISearchTab, let previousTab {
+            searchPreviousTabIndex = tabBarController.tabs.firstIndex { $0 === previousTab }
+        }
+        mkAutoActivateSearch(for: selectedTab)
+    }
+
+    /// KAN-751 workaround: re-adds search auto-focus without UIKit's
+    /// automaticallyActivatesSearch, whose synchronous activation inside the
+    /// tab-select commit strands a duplicate .integrated search bar. Activating
+    /// a beat later — after the tab-select transition settles — sidesteps that
+    /// race; deactivating when another tab is chosen stops the controller from
+    /// leaking its active state across tabs. The delayed closure re-checks that
+    /// the search tab is still selected, so a quick switch away cannot
+    /// reactivate it.
+    @available(iOS 18.0, *)
+    private func mkAutoActivateSearch(for selectedTab: UITab) {
+        let searchContent = NativeNavigationTabContentController.all.first {
+            $0.navigationItem.searchController != nil
+        }
+        guard let searchContent,
+              let searchController = searchContent.navigationItem.searchController else { return }
+        if selectedTab is UISearchTab {
+            // Focus on the content's next appearance (after the transition), so
+            // the bar and keyboard come up together instead of the delayed
+            // two-step a timer + isActive produced.
+            searchContent.mkAutoActivateSearchOnAppear = true
+        } else {
+            searchController.isActive = false
+        }
+    }
+
+    /// KAN-751: on search cancel (X), return to the tab the user came from,
+    /// matching UIKit's old automaticallyActivatesSearch behaviour. A
+    /// programmatic selectedIndex change does not fire the tab-select delegate,
+    /// so the WebView re-host and web notification are done here explicitly.
+    private func mkReturnFromSearch() {
+        guard let index = searchPreviousTabIndex,
+              let tabBarController = tabBarController,
+              index >= 0, index < tabIds.count else { return }
+        tabBarController.selectedIndex = index
+        hostWebViewInSelectedSystemTab()
+        notifyTabSelect(index: index)
+        searchPreviousTabIndex = nil
     }
 
     private func notifyTabSelect(index: Int) {
@@ -1618,14 +1667,18 @@ public class NativeNavigationPlugin: CAPPlugin, CAPBridgedPlugin, UITabBarContro
                 let searchTab = UISearchTab { [weak self] _ in
                     self?.makeSearchTabController(placeholder: placeholder) ?? UIViewController()
                 }
-                // Left off deliberately: with it on, UIKit presents the search
-                // controller the moment the tab is selected, and presenting one
-                // hides the tab bar — which is exactly the morph we want to
-                // watch. The field is one tap away either way.
+                // automaticallyActivatesSearch stays OFF: with it on, UIKit
+                // presents the search controller the instant the tab is
+                // selected, which races with the tab-bar morph, the WebView
+                // re-host, and article-open/back navigation. That race
+                // intermittently strands the .integrated (bottom) search bar
+                // rendered alongside the active (top) one — a dead duplicate
+                // bar the user cannot type in (KAN-751). Off means the field is
+                // one tap away, with no auto-present race.
                 //
                 // iOS 26 only, despite UISearchTab itself dating to 18.
                 if #available(iOS 26.0, *) {
-                    searchTab.automaticallyActivatesSearch = true
+                    searchTab.automaticallyActivatesSearch = false
                 }
                 entry = searchTab
             } else {
@@ -1666,6 +1719,9 @@ public class NativeNavigationPlugin: CAPPlugin, CAPBridgedPlugin, UITabBarContro
             },
             onSubmit: { [weak self] query in
                 self?.notifyListeners("searchSubmit", data: ["query": query])
+            },
+            onCancel: { [weak self] in
+                self?.mkReturnFromSearch()
             }
         )
         search.searchResultsUpdater = updater
@@ -3428,10 +3484,16 @@ final class NativeNavigationTabController: UITabBarController {
 final class NativeNavigationSearchQueryForwarder: NSObject, UISearchResultsUpdating, UISearchBarDelegate {
     private let onQueryChange: (String) -> Void
     private let onSubmit: (String) -> Void
+    private let onCancel: () -> Void
 
-    init(onQueryChange: @escaping (String) -> Void, onSubmit: @escaping (String) -> Void) {
+    init(
+        onQueryChange: @escaping (String) -> Void,
+        onSubmit: @escaping (String) -> Void,
+        onCancel: @escaping () -> Void
+    ) {
         self.onQueryChange = onQueryChange
         self.onSubmit = onSubmit
+        self.onCancel = onCancel
     }
 
     func updateSearchResults(for searchController: UISearchController) {
@@ -3443,6 +3505,13 @@ final class NativeNavigationSearchQueryForwarder: NSObject, UISearchResultsUpdat
     /// tell "still typing" from "go" — and pressing search did nothing at all.
     func searchBarSearchButtonClicked(_ searchBar: UISearchBar) {
         onSubmit(searchBar.text ?? "")
+    }
+
+    /// The cancel (X) button beside the search field. With UIKit's
+    /// automaticallyActivatesSearch off (KAN-751), cancelling no longer returns
+    /// to the previously selected tab on its own, so the plugin does it here.
+    func searchBarCancelButtonClicked(_ searchBar: UISearchBar) {
+        onCancel()
     }
 }
 
@@ -3490,6 +3559,13 @@ final class NativeNavigationTabContentController: UIViewController {
     /// Strong reference to the search forwarder, which `UISearchController`
     /// only holds weakly. Set for the search tab, nil for every other tab.
     var searchQueryForwarder: NativeNavigationSearchQueryForwarder?
+
+    /// KAN-751: set when the search tab is selected so the search field focuses
+    /// on the next appearance — after the tab transition, not on a fragile
+    /// timer. Focusing the integrated bar lets UIKit bring bar + keyboard up in
+    /// one motion, avoiding the delayed two-step of a manual isActive +
+    /// becomeFirstResponder.
+    var mkAutoActivateSearchOnAppear = false
 
     private weak var hostedWebView: UIView?
 
@@ -3554,6 +3630,18 @@ final class NativeNavigationTabContentController: UIViewController {
             return
         }
         hostedWebView?.frame = view.bounds
+    }
+
+    override func viewDidAppear(_ animated: Bool) {
+        super.viewDidAppear(animated)
+        // KAN-751: auto-focus the search here, once the tab transition is done
+        // and the view is really on screen. Focusing the integrated bar makes
+        // UIKit raise the bar and keyboard together — one motion, no lag — and
+        // running after the transition sidesteps the race that a synchronous
+        // automaticallyActivatesSearch caused.
+        guard mkAutoActivateSearchOnAppear else { return }
+        mkAutoActivateSearchOnAppear = false
+        navigationItem.searchController?.searchBar.becomeFirstResponder()
     }
 
     override func viewDidDisappear(_ animated: Bool) {
