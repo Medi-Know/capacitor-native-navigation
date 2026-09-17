@@ -3706,6 +3706,15 @@ final class NativeNavigationTabContentController: UIViewController {
     /// the old one — instead of an empty tab fading out and the old page
     /// fading back in under the wrong tab.
     func cover(with webView: UIView) {
+        // iOS 27 (KAN-753): the cover is a synchronous UIView snapshot of the web
+        // view, which iOS 27 returns BLANK — and a frame tracer showed there is
+        // no cross-dissolve for it to mask and the web view stays visible the
+        // whole switch. So the cover only laid a blank frame over the visible web
+        // view (~60-110ms) and WAS the flicker. Skipping it lets the web view
+        // stay visible and transition old→new route directly, with no blank.
+        if ProcessInfo.processInfo.operatingSystemVersion.majorVersion >= 27 {
+            return
+        }
         guard transitionCover == nil else {
             return
         }
