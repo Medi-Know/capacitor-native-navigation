@@ -627,6 +627,51 @@ export interface NativeNavigationTransitionEvent {
     duration: number;
 }
 /**
+ * A button shown in the native article toolbar. Taps report through
+ * `toolbarItemTap`.
+ */
+export interface NativeNavigationToolbarButton {
+    /** Stable id returned in `toolbarItemTap`. */
+    id: string;
+    /** Visible text label (used when no icon is given). */
+    title?: string;
+    /** Native icon descriptor (e.g. an SF Symbol). */
+    icon?: NativeNavigationIcon;
+    /** Whether the button is tappable; a disabled button is greyed out. Default true. */
+    enabled?: boolean;
+}
+/**
+ * A search-field-styled affordance filling the middle of the toolbar. It does
+ * not edit inline; a tap reports through `toolbarItemTap` so the app can open
+ * its own search UI.
+ */
+export interface NativeNavigationToolbarSearch {
+    /** Stable id returned in `toolbarItemTap`. */
+    id: string;
+    /** Placeholder shown in the field, e.g. "Im Artikel suchen". */
+    placeholder?: string;
+}
+/**
+ * Options for the native bottom action toolbar (article screen).
+ */
+export interface NativeNavigationToolbarOptions {
+    /** Remove the toolbar when true. */
+    hidden?: boolean;
+    /** Leading buttons (e.g. back / forward). */
+    leftItems?: NativeNavigationToolbarButton[];
+    /** Trailing buttons (e.g. AI tutor). */
+    rightItems?: NativeNavigationToolbarButton[];
+    /** A search-field-styled affordance filling the middle of the bar. */
+    search?: NativeNavigationToolbarSearch;
+}
+/**
+ * A tap on a native toolbar button.
+ */
+export interface NativeNavigationToolbarItemTapEvent {
+    id: string;
+    title?: string;
+}
+/**
  * Framework-agnostic native navigation chrome API.
  */
 export interface NativeNavigationPlugin {
@@ -642,6 +687,10 @@ export interface NativeNavigationPlugin {
      * Render or update the native tabbar.
      */
     setTabbar(options: NativeNavigationTabbarOptions): Promise<NativeNavigationInsetsResult>;
+    /**
+     * Render or update the native bottom action toolbar (article screen).
+     */
+    setToolbar(options: NativeNavigationToolbarOptions): Promise<void>;
     /**
      * Capture the current WebView and prepare a native transition.
      */
@@ -662,6 +711,7 @@ export interface NativeNavigationPlugin {
     getPluginVersion(): Promise<PluginVersionResult>;
     addListener(eventName: 'navbarBack', listenerFunc: (event: NativeNavigationBackEvent) => void): Promise<PluginListenerHandle>;
     addListener(eventName: 'navbarItemTap', listenerFunc: (event: NativeNavigationBarItemTapEvent) => void): Promise<PluginListenerHandle>;
+    addListener(eventName: 'toolbarItemTap', listenerFunc: (event: NativeNavigationToolbarItemTapEvent) => void): Promise<PluginListenerHandle>;
     addListener(eventName: 'tabSelect', listenerFunc: (event: NativeNavigationTabSelectEvent) => void): Promise<PluginListenerHandle>;
     addListener(eventName: 'safeAreaChanged', listenerFunc: (event: NativeNavigationSafeAreaChangedEvent) => void): Promise<PluginListenerHandle>;
     addListener(eventName: 'transitionStart', listenerFunc: (event: NativeNavigationTransitionEvent) => void): Promise<PluginListenerHandle>;

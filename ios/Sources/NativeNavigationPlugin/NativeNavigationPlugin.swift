@@ -32,6 +32,7 @@ public class NativeNavigationPlugin: CAPPlugin, CAPBridgedPlugin, UITabBarContro
         CAPPluginMethod(name: "configure", returnType: CAPPluginReturnPromise),
         CAPPluginMethod(name: "setNavbar", returnType: CAPPluginReturnPromise),
         CAPPluginMethod(name: "setTabbar", returnType: CAPPluginReturnPromise),
+        CAPPluginMethod(name: "setToolbar", returnType: CAPPluginReturnPromise),
         CAPPluginMethod(name: "beginTransition", returnType: CAPPluginReturnPromise),
         CAPPluginMethod(name: "finishTransition", returnType: CAPPluginReturnPromise),
         CAPPluginMethod(name: "finishTabTransition", returnType: CAPPluginReturnPromise),
@@ -47,6 +48,31 @@ public class NativeNavigationPlugin: CAPPlugin, CAPBridgedPlugin, UITabBarContro
     private var trailingTabEffectView: UIVisualEffectView?
     private var tabBar: UITabBar?
     private var floatingTabBar: NativeNavigationFloatingTabBar?
+
+    // Native bottom action bar for the article screen (article-toolbar feature).
+    private var toolbar: UIToolbar?
+    private var toolbarVisible = false
+    private var toolbarHeight: CGFloat = 50
+    private var toolbarItemTitle: [String: String] = [:]
+    // Hide-on-scroll: the toolbar slides out of the way while the reader scrolls
+    // down and returns on scroll up. Driven by observing the web view's scroll
+    // view; the inset stays put so the page never reflows mid-scroll.
+    private var toolbarScrollObservation: NSKeyValueObservation?
+    private var toolbarScrolledAway = false
+    private var toolbarLastScrollY: CGFloat = 0
+    private let toolbarScrollThreshold: CGFloat = 8
+    // A gradient-masked blur behind the toolbar so its buttons do not clash with
+    // the content scrolling under them. The scroll-edge effect cannot serve the
+    // bottom (there is no system bottom bar for it to measure against), so this
+    // stands in for it. It tracks the toolbar's visibility and hide-on-scroll.
+    private var bottomScrim: UIVisualEffectView?
+    private let bottomScrimFade: CGFloat = 48
+    // The matching blur behind the transparent top navbar, so the title and back
+    // button stay readable over the content. Replaces UIScrollView's top edge
+    // effect, which on iOS 27 stopped covering the navbar below the notch.
+    private var topScrim: UIVisualEffectView?
+    private let topScrimFade: CGFloat = 48
+
     private var tabbarStyle = NativeNavigationTabbarStyleConfig()
     private var tabBarController: NativeNavigationTabController?
     private var tabViewControllers: [UIViewController] = []
@@ -763,6 +789,332 @@ public class NativeNavigationPlugin: CAPPlugin, CAPBridgedPlugin, UITabBarContro
         ])
     }
 
+    /// Shows/updates a native bottom action bar (UIToolbar) for the article
+    /// screen. `leftItems`/`rightItems` are the same button shape as the navbar;
+    /// taps report through `toolbarItemTap`. `hidden:true` removes it. The bar's
+    /// height is reported as a bottom content inset so the page clears it.
+    @objc func setToolbar(_ call: CAPPluginCall) {
+        DispatchQueue.main.async {
+            guard self.isEnabled else {
+                self.toolbarVisible = false
+                self.stopToolbarScrollObservation()
+                self.toolbar?.isHidden = true
+                self.bottomScrim?.isHidden = true
+                self.updateInsetsAndNotify()
+                call.resolve()
+                return
+            }
+
+            let hidden = call.getBool("hidden", false)
+            self.toolbarVisible = !hidden
+            self.toolbarItemTitle.removeAll()
+
+            guard !hidden else {
+                self.stopToolbarScrollObservation()
+                self.toolbar?.isHidden = true
+                self.bottomScrim?.isHidden = true
+                self.updateInsetsAndNotify()
+                call.resolve()
+                return
+            }
+
+            let toolbar = self.ensureToolbar()
+            let left = self.makeToolbarButtonItems(call.getArray("leftItems") as? [[String: Any]] ?? [])
+            let right = self.makeToolbarButtonItems(call.getArray("rightItems") as? [[String: Any]] ?? [])
+            let flexible = { UIBarButtonItem(barButtonSystemItem: .flexibleSpace, target: nil, action: nil) }
+            if let search = call.getObject("search") {
+                // A search-field-styled item fills the middle, flanked by the
+                // nav buttons and the tutor button.
+                let searchItem = self.makeToolbarSearchItem(search)
+                toolbar.setItems(left + [flexible(), searchItem, flexible()] + right, animated: false)
+            } else {
+                toolbar.setItems(left + [flexible()] + right, animated: false)
+            }
+            toolbar.isHidden = false
+            self.ensureBottomScrim().isHidden = false
+            self.startToolbarScrollObservation()
+            self.layoutChrome()
+            self.updateInsetsAndNotify()
+            call.resolve()
+        }
+    }
+
+    @objc private func handleToolbarButton(_ sender: UIBarButtonItem) {
+        guard let id = sender.accessibilityIdentifier else {
+            return
+        }
+        notifyListeners("toolbarItemTap", data: [
+            "id": id,
+            "title": toolbarItemTitle[id] ?? ""
+        ])
+    }
+
+    private func ensureToolbar() -> UIToolbar {
+        if let toolbar = toolbar {
+            return toolbar
+        }
+        let bar = UIToolbar()
+        bar.autoresizingMask = [.flexibleWidth, .flexibleTopMargin]
+        bar.isTranslucent = true
+        bridge?.viewController?.view.addSubview(bar)
+        self.toolbar = bar
+        return bar
+    }
+
+    /// The blur behind the toolbar, created on first use. It never takes touches
+    /// and is laid out just below the toolbar so the buttons render on top.
+    private func ensureBottomScrim() -> UIVisualEffectView {
+        if let scrim = bottomScrim {
+            return scrim
+        }
+        let effect: UIVisualEffect
+        if #available(iOS 13.0, *) {
+            effect = UIBlurEffect(style: .systemThinMaterial)
+        } else {
+            effect = UIBlurEffect(style: .light)
+        }
+        let view = UIVisualEffectView(effect: effect)
+        view.isUserInteractionEnabled = false
+
+        // A vertical alpha ramp: clear at the top edge, opaque behind the bar, so
+        // the blur fades softly into the content instead of ending on a hard line.
+        let mask = CAGradientLayer()
+        mask.startPoint = CGPoint(x: 0.5, y: 0)
+        mask.endPoint = CGPoint(x: 0.5, y: 1)
+        mask.colors = [
+            UIColor(white: 1, alpha: 0).cgColor,
+            UIColor(white: 1, alpha: 1).cgColor,
+            UIColor(white: 1, alpha: 1).cgColor
+        ]
+        view.layer.mask = mask
+
+        bridge?.viewController?.view.addSubview(view)
+        bottomScrim = view
+        return view
+    }
+
+    /// Positions the scrim to cover the toolbar plus a fade zone above it, and
+    /// slides it away with the toolbar when it hides on scroll.
+    private func layoutBottomScrim() {
+        guard toolbarVisible, let rootView = bridge?.viewController?.view else {
+            return
+        }
+        let scrim = ensureBottomScrim()
+        let width = rootView.bounds.width
+        let height = rootView.bounds.height
+        let safeBottom = rootView.safeAreaInsets.bottom
+        let scrimHeight = safeBottom + toolbarHeight + bottomScrimFade
+        let top = toolbarScrolledAway ? height : (height - scrimHeight)
+        scrim.frame = CGRect(x: 0, y: top, width: width, height: scrimHeight)
+
+        if let mask = scrim.layer.mask as? CAGradientLayer {
+            let fadeFraction = scrimHeight > 0 ? Double(bottomScrimFade / scrimHeight) : 0
+            CATransaction.begin()
+            CATransaction.setDisableActions(true)
+            mask.frame = scrim.bounds
+            mask.locations = [NSNumber(value: 0.0), NSNumber(value: fadeFraction), NSNumber(value: 1.0)]
+            CATransaction.commit()
+        }
+    }
+
+    /// The blur behind the top navbar, created on first use; a mirror of the
+    /// bottom scrim with the ramp inverted. Never takes touches; the navbar
+    /// renders on top of it.
+    private func ensureTopScrim() -> UIVisualEffectView {
+        if let scrim = topScrim {
+            return scrim
+        }
+        let effect: UIVisualEffect
+        if #available(iOS 13.0, *) {
+            effect = UIBlurEffect(style: .systemThinMaterial)
+        } else {
+            effect = UIBlurEffect(style: .light)
+        }
+        let view = UIVisualEffectView(effect: effect)
+        view.isUserInteractionEnabled = false
+
+        // Opaque behind the navbar at the top, fading to clear into the content.
+        let mask = CAGradientLayer()
+        mask.startPoint = CGPoint(x: 0.5, y: 0)
+        mask.endPoint = CGPoint(x: 0.5, y: 1)
+        mask.colors = [
+            UIColor(white: 1, alpha: 1).cgColor,
+            UIColor(white: 1, alpha: 1).cgColor,
+            UIColor(white: 1, alpha: 0).cgColor
+        ]
+        view.layer.mask = mask
+
+        bridge?.viewController?.view.addSubview(view)
+        topScrim = view
+        return view
+    }
+
+    /// Covers the status bar and navbar plus a fade below, but only while a
+    /// non-hosted navbar is up (the article and similar detail screens). Hidden
+    /// otherwise — hosted-navbar pages reserve their own top space.
+    private func layoutTopScrim() {
+        guard let rootView = bridge?.viewController?.view else {
+            return
+        }
+        let show = isEnabled && navbarVisible && !navbarUsesHostedController
+        guard show else {
+            topScrim?.isHidden = true
+            return
+        }
+        let scrim = ensureTopScrim()
+        scrim.isHidden = false
+        let width = rootView.bounds.width
+        let safeTop = rootView.safeAreaInsets.top
+        let scrimHeight = safeTop + navbarHeight + topScrimFade
+        scrim.frame = CGRect(x: 0, y: 0, width: width, height: scrimHeight)
+
+        if let mask = scrim.layer.mask as? CAGradientLayer {
+            let opaqueFraction = scrimHeight > 0 ? Double((scrimHeight - topScrimFade) / scrimHeight) : 1
+            CATransaction.begin()
+            CATransaction.setDisableActions(true)
+            mask.frame = scrim.bounds
+            mask.locations = [NSNumber(value: 0.0), NSNumber(value: opaqueFraction), NSNumber(value: 1.0)]
+            CATransaction.commit()
+        }
+    }
+
+    /// Same button shape as `makeBarButtonItems`, but reporting through
+    /// `toolbarItemTap` and without the navbar's badge/menu machinery.
+    private func makeToolbarButtonItems(_ rawItems: [[String: Any]]) -> [UIBarButtonItem] {
+        return rawItems.map { rawItem in
+            let id = rawItem["id"] as? String ?? UUID().uuidString
+            let title = rawItem["title"] as? String
+            let image = self.image(from: rawItem["icon"] as? [String: Any])
+            let item = UIBarButtonItem(image: image, style: .plain, target: self, action: #selector(handleToolbarButton(_:)))
+            if image == nil {
+                item.title = title
+            }
+            item.isEnabled = rawItem["enabled"] as? Bool ?? true
+            item.accessibilityIdentifier = id
+            item.accessibilityLabel = title
+            toolbarItemTitle[id] = title ?? ""
+            return item
+        }
+    }
+
+    /// A search-field-styled, tappable item that fills the middle of the
+    /// toolbar. It does not edit inline — a tap reports through
+    /// `toolbarItemTap` so the app opens its own in-article find. Sized from
+    /// the current bar width, leaving room for the flanking buttons.
+    private func makeToolbarSearchItem(_ raw: [String: Any]) -> UIBarButtonItem {
+        let id = raw["id"] as? String ?? "article-search"
+        let placeholder = raw["placeholder"] as? String ?? ""
+        let height: CGFloat = 36
+
+        let field = UIButton(type: .system)
+        field.accessibilityIdentifier = id
+        field.accessibilityLabel = placeholder
+        field.translatesAutoresizingMaskIntoConstraints = false
+        field.contentHorizontalAlignment = .leading
+        field.tintColor = .secondaryLabel
+        field.addTarget(self, action: #selector(handleToolbarButton(_:)), for: .touchUpInside)
+
+        // A magnifier + placeholder only. On iOS 26 the toolbar already wraps
+        // this custom view in its own Liquid Glass capsule, exactly like the
+        // flanking button items — so adding an own fill produced a box inside a
+        // box. We keep the background clear and let that single system capsule
+        // be the field, so it reads as one native element.
+        let symbol = UIImage(systemName: "magnifyingglass",
+                             withConfiguration: UIImage.SymbolConfiguration(pointSize: 14, weight: .regular))
+        if #available(iOS 15.0, *) {
+            var config = UIButton.Configuration.plain()
+            config.image = symbol
+            config.imagePadding = 8
+            config.baseForegroundColor = .secondaryLabel
+            config.contentInsets = NSDirectionalEdgeInsets(top: 0, leading: 14, bottom: 0, trailing: 14)
+            var title = AttributedString(placeholder)
+            title.font = .systemFont(ofSize: 15)
+            config.attributedTitle = title
+            field.configuration = config
+        } else {
+            field.setImage(symbol, for: .normal)
+            field.setTitle(" \(placeholder)", for: .normal)
+            field.setTitleColor(.secondaryLabel, for: .normal)
+            field.titleLabel?.font = .systemFont(ofSize: 15)
+            field.contentEdgeInsets = UIEdgeInsets(top: 0, left: 14, bottom: 0, right: 14)
+        }
+
+        // A width CONSTRAINT is required — a toolbar sizes a custom view to its
+        // content otherwise. Kept well below the free middle: the bar also holds
+        // back/forward, expand-blocks and the tutor button, so an over-wide
+        // field pushed the right-hand buttons off the edge.
+        let barWidth = bridge?.viewController?.view.bounds.width ?? UIScreen.main.bounds.width
+        NSLayoutConstraint.activate([
+            field.widthAnchor.constraint(equalToConstant: max(110, barWidth * 0.35)),
+            field.heightAnchor.constraint(equalToConstant: height)
+        ])
+
+        let item = UIBarButtonItem(customView: field)
+        toolbarItemTitle[id] = placeholder
+        return item
+    }
+
+    /// Starts observing the web view's scroll so the toolbar can slide out of
+    /// the way on scroll-down and return on scroll-up. Idempotent.
+    private func startToolbarScrollObservation() {
+        guard toolbarScrollObservation == nil,
+              let scrollView = (webView as? WKWebView)?.scrollView else {
+            return
+        }
+        toolbarLastScrollY = scrollView.contentOffset.y
+        toolbarScrollObservation = scrollView.observe(\.contentOffset, options: [.new]) { [weak self] scrollView, _ in
+            self?.handleToolbarScroll(scrollView)
+        }
+    }
+
+    /// Stops the scroll observation and returns the toolbar to its shown slot.
+    private func stopToolbarScrollObservation() {
+        toolbarScrollObservation?.invalidate()
+        toolbarScrollObservation = nil
+        toolbarScrolledAway = false
+    }
+
+    /// Slides the toolbar away on downward scroll, back on upward scroll; always
+    /// shown near the top. A small threshold keeps tiny jitters from toggling it.
+    private func handleToolbarScroll(_ scrollView: UIScrollView) {
+        let y = scrollView.contentOffset.y
+        if y <= 0 {
+            toolbarLastScrollY = y
+            setToolbarScrolledAway(false)
+            return
+        }
+        let delta = y - toolbarLastScrollY
+        if delta > toolbarScrollThreshold {
+            toolbarLastScrollY = y
+            setToolbarScrolledAway(true)
+        } else if delta < -toolbarScrollThreshold {
+            toolbarLastScrollY = y
+            setToolbarScrolledAway(false)
+        }
+    }
+
+    /// Animates the toolbar between its shown slot and just below the screen.
+    /// The reported inset is left unchanged, so the page never reflows mid-scroll.
+    private func setToolbarScrolledAway(_ away: Bool) {
+        guard toolbarScrolledAway != away,
+              toolbarVisible,
+              let toolbar = toolbar,
+              let rootView = bridge?.viewController?.view else {
+            return
+        }
+        toolbarScrolledAway = away
+        let height = rootView.bounds.height
+        let safeInsets = rootView.safeAreaInsets
+        let targetY = away ? height : (height - safeInsets.bottom - toolbarHeight)
+        let scrimHeight = safeInsets.bottom + toolbarHeight + bottomScrimFade
+        let scrimTargetY = away ? height : (height - scrimHeight)
+        UIView.animate(withDuration: 0.25, delay: 0,
+                       options: [.curveEaseInOut, .beginFromCurrentState]) {
+            toolbar.frame.origin.y = targetY
+            self.bottomScrim?.frame.origin.y = scrimTargetY
+        }
+    }
+
     @objc private func handleNavbarBack() {
         notifyListeners("navbarBack", data: ["source": "navbar"])
     }
@@ -1386,20 +1738,11 @@ public class NativeNavigationPlugin: CAPPlugin, CAPBridgedPlugin, UITabBarContro
     /// - Parameter webView: The hosted web view, whose scrollView carries the
     ///   effect.
     private func applyScrollEdgeEffects(to webView: UIView) {
-        guard #available(iOS 26.0, *), let scrollView = (webView as? WKWebView)?.scrollView else {
-            return
-        }
-
-        scrollView.topEdgeEffect.style = .soft
-
-        // The style alone is a knob attached to nothing until UIKit knows which
-        // scroll view sits under the bar. It can usually find one itself, but
-        // not here: the web view is moved in and out of the content controller
-        // at runtime, so it is not there to be found when the bar is set up.
-        // This is what `setContentScrollView` exists for — and it has to be the
-        // controller that owns the bar, not the bridge's root.
-        (hostedContentController() ?? bridge?.viewController)?
-            .setContentScrollView(scrollView, for: .top)
+        // The top/bottom readability blur is now drawn by our own gradient-masked
+        // scrims (see layoutTopScrim / layoutBottomScrim), not UIScrollView's edge
+        // effects: the bottom has no system bar to anchor an effect against, and
+        // the top effect stopped covering the navbar below the notch on iOS 27.
+        // Kept as a no-op so the existing call sites need no change.
     }
 
     /// The content controller currently showing the web view, if the web view
@@ -2636,6 +2979,15 @@ public class NativeNavigationPlugin: CAPPlugin, CAPBridgedPlugin, UITabBarContro
             }
         }
 
+        if let toolbar = toolbar, toolbarVisible {
+            // When slid away for scrolling, sit fully below the screen; a layout
+            // pass must honour that or it would snap the bar back into view.
+            let y = toolbarScrolledAway ? height : (height - safeInsets.bottom - toolbarHeight)
+            toolbar.frame = CGRect(x: 0, y: y, width: width, height: toolbarHeight)
+        }
+        layoutBottomScrim()
+        layoutTopScrim()
+
         if let tabBarController = tabBarController {
             tabBarController.view.frame = CGRect(x: 0, y: 0, width: width, height: height)
             tabBarController.view.setNeedsLayout()
@@ -2646,6 +2998,18 @@ public class NativeNavigationPlugin: CAPPlugin, CAPBridgedPlugin, UITabBarContro
     }
 
     private func bringChromeToFront() {
+        // Scrim first, then the toolbar on top of it, both above the web view.
+        if let scrim = bottomScrim, toolbarVisible {
+            bridge?.viewController?.view.bringSubviewToFront(scrim)
+        }
+        if let toolbar = toolbar, toolbarVisible {
+            bridge?.viewController?.view.bringSubviewToFront(toolbar)
+        }
+        // Top scrim above the web view; the navbar container is brought forward
+        // below and so ends up on top of it.
+        if let topScrim = topScrim, !topScrim.isHidden {
+            bridge?.viewController?.view.bringSubviewToFront(topScrim)
+        }
         if usesSystemLiquidGlass && tabbarStyle.shape != .curve {
             if let navContainer = navContainer {
                 bridge?.viewController?.view.bringSubviewToFront(navContainer)
@@ -2776,10 +3140,14 @@ public class NativeNavigationPlugin: CAPPlugin, CAPBridgedPlugin, UITabBarContro
         let nativeTabHeight = max(tabBar?.frame.height ?? 0, 49 + safeInsets.bottom)
         let customTabHeight = tabbarHeight + safeInsets.bottom + tabbarStyle.bottomGap
         let tabHeight = isEnabled && tabbarVisible ? (usesSystemTabbar ? nativeTabHeight : customTabHeight) : 0
+        // The article toolbar and the tab bar never share the screen (the tab
+        // bar is hidden on detail), so the larger of the two is the bottom inset.
+        let toolbarInset = isEnabled && toolbarVisible ? toolbarHeight + safeInsets.bottom : 0
+        let bottom = max(tabHeight, toolbarInset)
         return [
             "top": navHeight,
             "right": safeInsets.right,
-            "bottom": tabHeight,
+            "bottom": bottom,
             "left": safeInsets.left,
             "navbarHeight": navHeight,
             "tabbarHeight": tabHeight
