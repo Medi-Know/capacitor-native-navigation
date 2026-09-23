@@ -823,10 +823,23 @@ public class NativeNavigationPlugin: CAPPlugin, CAPBridgedPlugin, UITabBarContro
             let right = self.makeToolbarButtonItems(call.getArray("rightItems") as? [[String: Any]] ?? [])
             let flexible = { UIBarButtonItem(barButtonSystemItem: .flexibleSpace, target: nil, action: nil) }
             if let search = call.getObject("search") {
-                // A search-field-styled item fills the middle, flanked by the
-                // nav buttons and the tutor button.
-                let searchItem = self.makeToolbarSearchItem(search)
-                toolbar.setItems(left + [flexible(), searchItem, flexible()] + right, animated: false)
+                let barWidth = self.bridge?.viewController?.view.bounds.width ?? UIScreen.main.bounds.width
+                if left.isEmpty {
+                    // No leading buttons (the study-plan drawer article): left-align
+                    // the field so it reaches the left edge and widen it toward the
+                    // trailing actions, which the flexible space pushes to the right.
+                    // Reserve generously per right item — the iOS 26 Liquid Glass
+                    // capsule is much wider than the bare icon — plus the bar insets
+                    // and a gap, so those buttons are never clipped off the edge.
+                    let rightReserve = CGFloat(right.count) * 68 + 96
+                    let searchItem = self.makeToolbarSearchItem(search, width: max(140, barWidth - rightReserve))
+                    toolbar.setItems([searchItem, flexible()] + right, animated: false)
+                } else {
+                    // Back/forward on the left (full-screen article): the field sits
+                    // centred in the free middle, flanked by the nav and tutor buttons.
+                    let searchItem = self.makeToolbarSearchItem(search, width: barWidth * 0.35)
+                    toolbar.setItems(left + [flexible(), searchItem, flexible()] + right, animated: false)
+                }
             } else {
                 toolbar.setItems(left + [flexible()] + right, animated: false)
             }
@@ -1001,7 +1014,7 @@ public class NativeNavigationPlugin: CAPPlugin, CAPBridgedPlugin, UITabBarContro
     /// toolbar. It does not edit inline — a tap reports through
     /// `toolbarItemTap` so the app opens its own in-article find. Sized from
     /// the current bar width, leaving room for the flanking buttons.
-    private func makeToolbarSearchItem(_ raw: [String: Any]) -> UIBarButtonItem {
+    private func makeToolbarSearchItem(_ raw: [String: Any], width: CGFloat) -> UIBarButtonItem {
         let id = raw["id"] as? String ?? "article-search"
         let placeholder = raw["placeholder"] as? String ?? ""
         let height: CGFloat = 36
@@ -1040,12 +1053,11 @@ public class NativeNavigationPlugin: CAPPlugin, CAPBridgedPlugin, UITabBarContro
         }
 
         // A width CONSTRAINT is required — a toolbar sizes a custom view to its
-        // content otherwise. Kept well below the free middle: the bar also holds
-        // back/forward, expand-blocks and the tutor button, so an over-wide
-        // field pushed the right-hand buttons off the edge.
-        let barWidth = bridge?.viewController?.view.bounds.width ?? UIScreen.main.bounds.width
+        // content otherwise. The caller decides it: a fraction of the bar when
+        // it also holds back/forward + the tutor button, or a near-full fill
+        // when there are no leading buttons (the drawer article).
         NSLayoutConstraint.activate([
-            field.widthAnchor.constraint(equalToConstant: max(110, barWidth * 0.35)),
+            field.widthAnchor.constraint(equalToConstant: max(110, width)),
             field.heightAnchor.constraint(equalToConstant: height)
         ])
 
