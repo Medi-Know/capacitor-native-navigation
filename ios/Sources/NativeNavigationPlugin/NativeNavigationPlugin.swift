@@ -1939,7 +1939,13 @@ public class NativeNavigationPlugin: CAPPlugin, CAPBridgedPlugin, UITabBarContro
         for entry in entries {
             let id: String = entry["id"] as? String ?? UUID().uuidString
             let title: String = entry["title"] as? String ?? ""
-            let iconImage: UIImage? = image(from: entry["icon"] as? [String: Any])
+            var iconImage: UIImage? = image(from: entry["icon"] as? [String: Any])
+            // A menu tints template images with the button's colour; an entry
+            // with its own tintColor keeps that colour instead, e.g. grey icons
+            // under a coloured button.
+            if let tint = (entry["tintColor"] as? String).flatMap({ UIColor(hex: $0) }) {
+                iconImage = iconImage?.withTintColor(tint, renderingMode: .alwaysOriginal)
+            }
 
             if let children = entry["children"] as? [[String: Any]] {
                 elements.append(UIMenu(title: title, image: iconImage, children: makeMenuElements(children)))

@@ -260,6 +260,8 @@ export interface NativeNavigationMenuEntry {
     keepsMenuOpen?: boolean;
     /** Ticked (iOS `UIMenuElement.State.on`), for the option in force. */
     checked?: boolean;
+    /** Fixed colour of the entry's icon as `#RRGGBB`; by default it takes the button's tint. */
+    tintColor?: string;
     /**
      * Makes the entry a submenu of these entries. A submenu reports no tap
      * of its own; its children report with their ids like any entry.
