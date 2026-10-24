@@ -1878,7 +1878,7 @@ public class NativeNavigationPlugin: CAPPlugin, CAPBridgedPlugin, UITabBarContro
             // image would flatten the dot into the symbol's own colour.
             if let badge = (rawItem["badgeColor"] as? String).flatMap({ UIColor(hex: $0) }),
                let base = image {
-                image = badged(base, tint: tint ?? .label, badge: badge)
+                image = badged(base, tint: tint ?? .label, badge: badge, symbol: rawItem["badgeSymbol"] as? String)
             }
             let item = UIBarButtonItem(image: image, style: .plain, target: self, action: #selector(handleNavbarButton(_:)))
             if image == nil {
@@ -2439,11 +2439,16 @@ public class NativeNavigationPlugin: CAPPlugin, CAPBridgedPlugin, UITabBarContro
         }
     }
 
-    /// Draws `base` in `tint` with a filled dot in its top-right corner.
+    /// Draws `base` in `tint` with a filled dot in its top-right corner, or,
+    /// given `symbol`, that SF Symbol in its bottom-right corner (a check
+    /// marking "your own", say), its fill in `badge` and its glyph in white.
     ///
     /// The result is an original-mode image: it carries two colours, and a
     /// template would discard both.
-    private func badged(_ base: UIImage, tint: UIColor, badge: UIColor) -> UIImage {
+    private func badged(_ base: UIImage, tint: UIColor, badge: UIColor, symbol: String? = nil) -> UIImage {
+        if let symbol = symbol {
+            return symbolBadged(base, tint: tint, badge: badge, symbol: symbol)
+        }
         let inset = base.size.width * 0.08
         let size = CGSize(width: base.size.width + inset, height: base.size.height + inset)
         let diameter = max(base.size.width * 0.34, 6)
@@ -2470,6 +2475,38 @@ public class NativeNavigationPlugin: CAPPlugin, CAPBridgedPlugin, UITabBarContro
 
             badge.setFill()
             context.cgContext.fillEllipse(in: dot)
+        }.withRenderingMode(.alwaysOriginal)
+    }
+
+    /// `badged` with an SF Symbol in the bottom-right corner instead of a dot.
+    private func symbolBadged(_ base: UIImage, tint: UIColor, badge: UIColor, symbol: String) -> UIImage {
+        let diameter = max(base.size.width * 0.45, 8)
+        let inset = diameter * 0.25
+        let size = CGSize(width: base.size.width + inset, height: base.size.height + inset)
+        let configuration = UIImage.SymbolConfiguration(paletteColors: [.white, badge])
+        let mark = UIImage(systemName: symbol, withConfiguration: configuration)
+
+        let format = UIGraphicsImageRendererFormat.default()
+        format.opaque = false
+
+        return UIGraphicsImageRenderer(size: size, format: format).image { context in
+            tint.setFill()
+            base.withRenderingMode(.alwaysTemplate)
+                .draw(in: CGRect(x: 0, y: 0, width: base.size.width, height: base.size.height))
+
+            let spot = CGRect(
+                x: size.width - diameter,
+                y: size.height - diameter,
+                width: diameter,
+                height: diameter
+            )
+            // The same clear ring as around the dot, so the mark reads as
+            // separate from the glyph beneath it.
+            context.cgContext.setBlendMode(.clear)
+            context.cgContext.fillEllipse(in: spot.insetBy(dx: -1.5, dy: -1.5))
+            context.cgContext.setBlendMode(.normal)
+
+            mark?.draw(in: spot)
         }.withRenderingMode(.alwaysOriginal)
     }
 

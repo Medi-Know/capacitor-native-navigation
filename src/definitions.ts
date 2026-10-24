@@ -302,6 +302,11 @@ export interface NativeNavigationBarButton {
    * image, since a two-coloured icon cannot stay a template.
    */
   badgeColor?: string;
+  /**
+   * SF Symbol drawn in `badgeColor` at the bottom-right corner instead of
+   * the top-right dot, e.g. `checkmark.circle.fill`. Its glyph is white.
+   */
+  badgeSymbol?: string;
 
   /**
    * Whether the action is enabled. Defaults to `true`.
