@@ -65,8 +65,10 @@ public class NativeNavigationPlugin: CAPPlugin, CAPBridgedPlugin, UITabBarContro
     // the content scrolling under them. The scroll-edge effect cannot serve the
     // bottom (there is no system bottom bar for it to measure against), so this
     // stands in for it. It tracks the toolbar's visibility and hide-on-scroll.
+    // No fade zone above the bar: like the bars of Apple's own apps it ends on a
+    // hard edge, so the text stays readable right down to the toolbar.
     private var bottomScrim: UIVisualEffectView?
-    private let bottomScrimFade: CGFloat = 48
+    private let bottomScrimFade: CGFloat = 0
     // The matching blur behind the transparent top navbar, so the title and back
     // button stay readable over the content. Replaces UIScrollView's top edge
     // effect, which on iOS 27 stopped covering the navbar below the notch.
@@ -889,8 +891,8 @@ public class NativeNavigationPlugin: CAPPlugin, CAPBridgedPlugin, UITabBarContro
         let view = UIVisualEffectView(effect: effect)
         view.isUserInteractionEnabled = false
 
-        // A vertical alpha ramp: clear at the top edge, opaque behind the bar, so
-        // the blur fades softly into the content instead of ending on a hard line.
+        // A vertical alpha ramp over `bottomScrimFade`: clear at the top edge,
+        // opaque behind the bar. With a fade of 0 the blur ends on a hard line.
         let mask = CAGradientLayer()
         mask.startPoint = CGPoint(x: 0.5, y: 0)
         mask.endPoint = CGPoint(x: 0.5, y: 1)
