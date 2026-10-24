@@ -237,8 +237,8 @@ export interface NativeNavigationBarButton {
      */
     badgeColor?: string;
     /**
-     * SF Symbol drawn in `badgeColor` at the bottom-right corner instead of
-     * the top-right dot, e.g. `checkmark.circle.fill`. Its glyph is white.
+     * SF Symbol drawn in white on a `badgeColor` disc at the bottom-right
+     * corner instead of the top-right dot, e.g. `checkmark`.
      */
     badgeSymbol?: string;
     /**

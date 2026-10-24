@@ -2440,8 +2440,8 @@ public class NativeNavigationPlugin: CAPPlugin, CAPBridgedPlugin, UITabBarContro
     }
 
     /// Draws `base` in `tint` with a filled dot in its top-right corner, or,
-    /// given `symbol`, that SF Symbol in its bottom-right corner (a check
-    /// marking "your own", say), its fill in `badge` and its glyph in white.
+    /// given `symbol`, a disc in `badge` at its bottom-right corner with that
+    /// SF Symbol in white on it (a check marking "your own", say).
     ///
     /// The result is an original-mode image: it carries two colours, and a
     /// template would discard both.
@@ -2483,8 +2483,11 @@ public class NativeNavigationPlugin: CAPPlugin, CAPBridgedPlugin, UITabBarContro
         let diameter = max(base.size.width * 0.45, 8)
         let inset = diameter * 0.25
         let size = CGSize(width: base.size.width + inset, height: base.size.height + inset)
-        let configuration = UIImage.SymbolConfiguration(paletteColors: [.white, badge])
-        let mark = UIImage(systemName: symbol, withConfiguration: configuration)
+        // Tinted explicitly: a palette configuration is not applied when a
+        // symbol is drawn into a context, which left a black, invisible mark.
+        let configuration = UIImage.SymbolConfiguration(weight: .bold)
+        let mark = UIImage(systemName: symbol, withConfiguration: configuration)?
+            .withTintColor(.white, renderingMode: .alwaysOriginal)
 
         let format = UIGraphicsImageRendererFormat.default()
         format.opaque = false
@@ -2506,7 +2509,22 @@ public class NativeNavigationPlugin: CAPPlugin, CAPBridgedPlugin, UITabBarContro
             context.cgContext.fillEllipse(in: spot.insetBy(dx: -1.5, dy: -1.5))
             context.cgContext.setBlendMode(.normal)
 
-            mark?.draw(in: spot)
+            badge.setFill()
+            context.cgContext.fillEllipse(in: spot)
+
+            // The mark centred in the disc at about half its size, kept in
+            // its own proportions.
+            if let mark = mark {
+                let side = diameter * 0.55
+                let scale = min(side / max(mark.size.width, 1), side / max(mark.size.height, 1))
+                let markSize = CGSize(width: mark.size.width * scale, height: mark.size.height * scale)
+                mark.draw(in: CGRect(
+                    x: spot.midX - markSize.width / 2,
+                    y: spot.midY - markSize.height / 2,
+                    width: markSize.width,
+                    height: markSize.height
+                ))
+            }
         }.withRenderingMode(.alwaysOriginal)
     }
 
