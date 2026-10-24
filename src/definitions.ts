@@ -665,6 +665,16 @@ export interface NativeNavigationToolbarButton {
   icon?: NativeNavigationIcon;
   /** Whether the button is tappable; a disabled button is greyed out. Default true. */
   enabled?: boolean;
+  /**
+   * Colour for this button alone, as `#RRGGBB` or `#RRGGBBAA`. Omitted, it
+   * inherits the bar's tint. With `prominent` it fills the capsule.
+   */
+  tintColor?: string;
+  /**
+   * Marks the screen's main action: iOS 26 draws it as a filled capsule
+   * (`UIBarButtonItem.Style.prominent`), earlier versions in bold text.
+   */
+  prominent?: boolean;
 }
 
 /**

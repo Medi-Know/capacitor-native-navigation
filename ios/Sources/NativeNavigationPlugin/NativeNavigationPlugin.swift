@@ -1003,6 +1003,18 @@ public class NativeNavigationPlugin: CAPPlugin, CAPBridgedPlugin, UITabBarContro
                 item.title = title
             }
             item.isEnabled = rawItem["enabled"] as? Bool ?? true
+            if let tint = rawItem["tintColor"] as? String, let colour = UIColor(hex: tint) {
+                item.tintColor = colour
+            }
+            // The screen's main action: a filled capsule in the item's tint on
+            // iOS 26, bold text before that, where bar items have no fill.
+            if rawItem["prominent"] as? Bool ?? false {
+                if #available(iOS 26.0, *) {
+                    item.style = .prominent
+                } else {
+                    item.setTitleTextAttributes([.font: UIFont.boldSystemFont(ofSize: 17)], for: .normal)
+                }
+            }
             item.accessibilityIdentifier = id
             item.accessibilityLabel = title
             toolbarItemTitle[id] = title ?? ""
