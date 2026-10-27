@@ -69,6 +69,9 @@ public class NativeNavigationPlugin: CAPPlugin, CAPBridgedPlugin, UITabBarContro
     // hard edge, so the text stays readable right down to the toolbar.
     private var bottomScrim: UIVisualEffectView?
     private let bottomScrimFade: CGFloat = 0
+    // Off: the toolbar's glass buttons float over the article on their own,
+    // with no band behind them. Kept switchable so the blur can come back.
+    private let showsBottomScrim = false
     // The matching blur behind the transparent top navbar, so the title and back
     // button stay readable over the content. Replaces UIScrollView's top edge
     // effect, which on iOS 27 stopped covering the navbar below the notch.
@@ -846,7 +849,9 @@ public class NativeNavigationPlugin: CAPPlugin, CAPBridgedPlugin, UITabBarContro
                 toolbar.setItems(left + [flexible()] + right, animated: false)
             }
             toolbar.isHidden = false
-            self.ensureBottomScrim().isHidden = false
+            if self.showsBottomScrim {
+                self.ensureBottomScrim().isHidden = false
+            }
             self.startToolbarScrollObservation()
             self.layoutChrome()
             self.updateInsetsAndNotify()
@@ -871,6 +876,15 @@ public class NativeNavigationPlugin: CAPPlugin, CAPBridgedPlugin, UITabBarContro
         let bar = UIToolbar()
         bar.autoresizingMask = [.flexibleWidth, .flexibleTopMargin]
         bar.isTranslucent = true
+        // No bar background either: only the buttons themselves are drawn.
+        let appearance = UIToolbarAppearance()
+        appearance.configureWithTransparentBackground()
+        bar.standardAppearance = appearance
+        bar.compactAppearance = appearance
+        if #available(iOS 15.0, *) {
+            bar.scrollEdgeAppearance = appearance
+            bar.compactScrollEdgeAppearance = appearance
+        }
         bridge?.viewController?.view.addSubview(bar)
         self.toolbar = bar
         return bar
@@ -911,7 +925,7 @@ public class NativeNavigationPlugin: CAPPlugin, CAPBridgedPlugin, UITabBarContro
     /// Positions the scrim to cover the toolbar plus a fade zone above it, and
     /// slides it away with the toolbar when it hides on scroll.
     private func layoutBottomScrim() {
-        guard toolbarVisible, let rootView = bridge?.viewController?.view else {
+        guard showsBottomScrim, toolbarVisible, let rootView = bridge?.viewController?.view else {
             return
         }
         let scrim = ensureBottomScrim()
